@@ -23,6 +23,19 @@ from odda_utils.database import (
     insert_dataset_file,
     get_dataset_files,
     delete_dataset_files,
+    _decode_json,
+    insert_quantification_run,
+    get_quantification_run as _get_quantification_run,
+    get_quantification_runs as _get_quantification_runs,
+    insert_analysis_run,
+    get_analysis_run as _get_analysis_run,
+    get_analysis_runs as _get_analysis_runs,
+    insert_dep_results,
+    get_dep_results as _get_dep_results,
+    insert_benchmark_annotation,
+    get_benchmark_annotations as _get_benchmark_annotations,
+    insert_benchmark_prediction,
+    get_benchmark_predictions as _get_benchmark_predictions,
 )
 from odda_utils.fetching import (
     catalog_local_dataset_files,
@@ -100,6 +113,34 @@ from odda_utils.schema_info import (
 from odda_utils.dataset_utils import (
     check_dataset_exists as _check_dataset_exists,
     DatasetExistsResult,
+)
+from odda_utils.fidelity import (
+    FidelityReport,
+    assemble_report,
+    compare_deps,
+    compare_identifications,
+    compare_quantitative,
+    compare_versions,
+    load_dep_results,
+    load_diann_pg_matrix,
+    load_matrix,
+    load_maxquant_protein_groups,
+)
+from odda_utils.meta_analysis import (
+    run_meta_analysis as _run_meta_analysis,
+    run_meta_analysis_batch as _run_meta_analysis_batch,
+    MetaAnalysisBatchResult,
+    MetaAnalysisResult,
+    PooledEstimate,
+    Heterogeneity,
+)
+from odda_utils.injection_scan import (
+    scan_injection as _scan_injection,
+    scan_injection_batch as _scan_injection_batch,
+    InjectionScanResult,
+    InjectionScanBatchResult,
+    CategorySignal,
+    InjectionMatch,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,6 +256,111 @@ class PublicationDateUpdateResult:
 
 
 # ---------------------------------------------------------------------------
+# Provenance / research-object layer dataclasses (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QuantificationRun:
+    """A quantification run provenance record."""
+
+    id: int
+    dataset_id: Optional[str] = None
+    tool: Optional[str] = None
+    tool_version: Optional[str] = None
+    container_image: Optional[str] = None
+    container_sha256: Optional[str] = None
+    param_file_path: Optional[str] = None
+    param_file_sha256: Optional[str] = None
+    command: Optional[str] = None
+    input_files: Optional[list] = None
+    output_dir: Optional[str] = None
+    exit_status: Optional[int] = None
+    wall_time_sec: Optional[float] = None
+    host: Optional[str] = None
+    extraction_model: Optional[str] = None
+    provider: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class AnalysisRun:
+    """An analysis run provenance record."""
+
+    id: int
+    quantification_run_id: Optional[int] = None
+    analysis_type: Optional[str] = None
+    method: Optional[str] = None
+    library: Optional[str] = None
+    library_version: Optional[str] = None
+    parameters: Optional[object] = None
+    code_sha256: Optional[str] = None
+    random_seed: Optional[int] = None
+    input_paths: Optional[list] = None
+    output_paths: Optional[list] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class DepResult:
+    """A single differential expression result row."""
+
+    id: int
+    analysis_run_id: Optional[int] = None
+    feature_id: Optional[str] = None
+    log2fc: Optional[float] = None
+    pvalue: Optional[float] = None
+    padj: Optional[float] = None
+    direction: Optional[str] = None
+    significant: Optional[bool] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class DepResultsWriteResult:
+    """Result of a bulk differential-expression results write."""
+
+    analysis_run_id: int
+    inserted: int
+    ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BenchmarkAnnotation:
+    """A benchmark (ground-truth) annotation record."""
+
+    id: int
+    doi: Optional[str] = None
+    pmid: Optional[str] = None
+    pmcid: Optional[str] = None
+    dataset_id: Optional[str] = None
+    annotator: Optional[str] = None
+    label: Optional[str] = None
+    category: Optional[str] = None
+    evidence_text: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class BenchmarkPrediction:
+    """A benchmark prediction record."""
+
+    id: int
+    doi: Optional[str] = None
+    pmid: Optional[str] = None
+    pmcid: Optional[str] = None
+    dataset_id: Optional[str] = None
+    predicted_label: Optional[str] = None
+    confidence: Optional[float] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    run_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
@@ -296,6 +442,98 @@ def _detect_id_type(identifier: str) -> str:
     if identifier.isdigit():
         return "pmid"
     return "doi"
+
+
+def _row_to_quantification_run(row) -> QuantificationRun:
+    """Convert a quantification_runs row into a QuantificationRun dataclass."""
+    return QuantificationRun(
+        id=row["id"],
+        dataset_id=row["dataset_id"],
+        tool=row["tool"],
+        tool_version=row["tool_version"],
+        container_image=row["container_image"],
+        container_sha256=row["container_sha256"],
+        param_file_path=row["param_file_path"],
+        param_file_sha256=row["param_file_sha256"],
+        command=row["command"],
+        input_files=_decode_json(row["input_files_json"]),
+        output_dir=row["output_dir"],
+        exit_status=row["exit_status"],
+        wall_time_sec=row["wall_time_sec"],
+        host=row["host"],
+        extraction_model=row["extraction_model"],
+        provider=row["provider"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_analysis_run(row) -> AnalysisRun:
+    """Convert an analysis_runs row into an AnalysisRun dataclass."""
+    return AnalysisRun(
+        id=row["id"],
+        quantification_run_id=row["quantification_run_id"],
+        analysis_type=row["analysis_type"],
+        method=row["method"],
+        library=row["library"],
+        library_version=row["library_version"],
+        parameters=_decode_json(row["parameters_json"]),
+        code_sha256=row["code_sha256"],
+        random_seed=row["random_seed"],
+        input_paths=_decode_json(row["input_paths_json"]),
+        output_paths=_decode_json(row["output_paths_json"]),
+        provider=row["provider"],
+        model=row["model"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_dep_result(row) -> DepResult:
+    """Convert a dep_results row into a DepResult dataclass."""
+    significant = row["significant"]
+    return DepResult(
+        id=row["id"],
+        analysis_run_id=row["analysis_run_id"],
+        feature_id=row["feature_id"],
+        log2fc=row["log2fc"],
+        pvalue=row["pvalue"],
+        padj=row["padj"],
+        direction=row["direction"],
+        significant=None if significant is None else bool(significant),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_benchmark_annotation(row) -> BenchmarkAnnotation:
+    """Convert a benchmark_annotations row into a BenchmarkAnnotation dataclass."""
+    return BenchmarkAnnotation(
+        id=row["id"],
+        doi=row["doi"],
+        pmid=row["pmid"],
+        pmcid=row["pmcid"],
+        dataset_id=row["dataset_id"],
+        annotator=row["annotator"],
+        label=row["label"],
+        category=row["category"],
+        evidence_text=row["evidence_text"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_benchmark_prediction(row) -> BenchmarkPrediction:
+    """Convert a benchmark_predictions row into a BenchmarkPrediction dataclass."""
+    return BenchmarkPrediction(
+        id=row["id"],
+        doi=row["doi"],
+        pmid=row["pmid"],
+        pmcid=row["pmcid"],
+        dataset_id=row["dataset_id"],
+        predicted_label=row["predicted_label"],
+        confidence=row["confidence"],
+        model=row["model"],
+        provider=row["provider"],
+        run_at=row["run_at"],
+        created_at=row["created_at"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2295,6 +2533,918 @@ def check_dataset_exists(
         DatasetExistsResult with existence status and path information.
     """
     return _check_dataset_exists(dataset_id=dataset_id, datasets_dir=datasets_dir)
+
+
+# ---------------------------------------------------------------------------
+# Provenance / research-object layer tools (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@app.tool()
+def record_quantification_run(
+    db_path: str | Path,
+    dataset_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    tool_version: Optional[str] = None,
+    container_image: Optional[str] = None,
+    container_sha256: Optional[str] = None,
+    param_file_path: Optional[str] = None,
+    param_file_sha256: Optional[str] = None,
+    command: Optional[str] = None,
+    input_files: Optional[list[str]] = None,
+    output_dir: Optional[str] = None,
+    exit_status: Optional[int] = None,
+    wall_time_sec: Optional[float] = None,
+    host: Optional[str] = None,
+    extraction_model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> QuantificationRun:
+    """Record a quantification run as a reproducible research object.
+
+    Stores full provenance for a single execution of an omic quantification
+    tool (e.g., DIA-NN, MaxQuant) against a dataset: tool version, container
+    image + digest, parameter file + hash, command line, input files, output
+    directory, exit status, wall time, host, and optional model/provider.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        dataset_id: Source dataset identifier (e.g., "PXD012345").
+        tool: Quantification tool name.
+        tool_version: Version string of the tool.
+        container_image: Container image reference (name:tag).
+        container_sha256: SHA-256 digest of the container image.
+        param_file_path: Path to the parameter/config file used.
+        param_file_sha256: SHA-256 hash of the parameter file contents.
+        command: Full command line executed.
+        input_files: List of input file paths (stored as JSON).
+        output_dir: Directory where outputs were written.
+        exit_status: Process exit status code.
+        wall_time_sec: Wall-clock run time in seconds.
+        host: Host/machine identifier.
+        extraction_model: LLM model used to derive parameters, if any.
+        provider: LLM/compute provider (e.g., "azure").
+
+    Returns:
+        The created QuantificationRun record, including its new id.
+    """
+    conn = init_db(db_path)
+    try:
+        run_id = insert_quantification_run(
+            conn,
+            dataset_id=dataset_id,
+            tool=tool,
+            tool_version=tool_version,
+            container_image=container_image,
+            container_sha256=container_sha256,
+            param_file_path=param_file_path,
+            param_file_sha256=param_file_sha256,
+            command=command,
+            input_files=input_files,
+            output_dir=output_dir,
+            exit_status=exit_status,
+            wall_time_sec=wall_time_sec,
+            host=host,
+            extraction_model=extraction_model,
+            provider=provider,
+        )
+        return _row_to_quantification_run(_get_quantification_run(conn, run_id))
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_quantification_run(
+    db_path: str | Path,
+    run_id: int,
+) -> Optional[QuantificationRun]:
+    """Retrieve a single quantification run by ID.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        run_id: The quantification run ID.
+
+    Returns:
+        The QuantificationRun record, or None if not found.
+    """
+    conn = init_db(db_path)
+    try:
+        row = _get_quantification_run(conn, run_id)
+        return _row_to_quantification_run(row) if row else None
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_quantification_runs(
+    db_path: str | Path,
+    dataset_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[QuantificationRun]:
+    """Retrieve quantification runs, optionally filtered.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        dataset_id: Filter by source dataset identifier.
+        tool: Filter by tool name.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of QuantificationRun records, newest first.
+    """
+    conn = init_db(db_path)
+    try:
+        rows = _get_quantification_runs(conn, dataset_id=dataset_id, tool=tool, limit=limit)
+        return [_row_to_quantification_run(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.tool()
+def record_analysis_run(
+    db_path: str | Path,
+    analysis_type: Optional[str] = None,
+    method: Optional[str] = None,
+    quantification_run_id: Optional[int] = None,
+    library: Optional[str] = None,
+    library_version: Optional[str] = None,
+    parameters: Optional[dict] = None,
+    code_sha256: Optional[str] = None,
+    random_seed: Optional[int] = None,
+    input_paths: Optional[list[str]] = None,
+    output_paths: Optional[list[str]] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> AnalysisRun:
+    """Record a downstream analysis run as a reproducible research object.
+
+    Stores provenance for a QC / differential expression (DE) / enrichment (or
+    other) analysis performed on quantified data. Optionally links back to the
+    quantification run that produced its inputs.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        analysis_type: Type of analysis (e.g., "QC", "DE", "enrichment").
+        method: Method/algorithm name.
+        quantification_run_id: ID of the parent quantification run, if any.
+        library: Analysis library/package name.
+        library_version: Version of the analysis library.
+        parameters: Analysis parameters dict (stored as JSON).
+        code_sha256: SHA-256 hash of the analysis code.
+        random_seed: Random seed used for reproducibility.
+        input_paths: List of input paths (stored as JSON).
+        output_paths: List of output paths (stored as JSON).
+        provider: LLM/compute provider, if any.
+        model: LLM model used, if any.
+
+    Returns:
+        The created AnalysisRun record, including its new id.
+    """
+    conn = init_db(db_path)
+    try:
+        run_id = insert_analysis_run(
+            conn,
+            analysis_type=analysis_type,
+            method=method,
+            quantification_run_id=quantification_run_id,
+            library=library,
+            library_version=library_version,
+            parameters=parameters,
+            code_sha256=code_sha256,
+            random_seed=random_seed,
+            input_paths=input_paths,
+            output_paths=output_paths,
+            provider=provider,
+            model=model,
+        )
+        return _row_to_analysis_run(_get_analysis_run(conn, run_id))
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_analysis_run(
+    db_path: str | Path,
+    run_id: int,
+) -> Optional[AnalysisRun]:
+    """Retrieve a single analysis run by ID.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        run_id: The analysis run ID.
+
+    Returns:
+        The AnalysisRun record, or None if not found.
+    """
+    conn = init_db(db_path)
+    try:
+        row = _get_analysis_run(conn, run_id)
+        return _row_to_analysis_run(row) if row else None
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_analysis_runs(
+    db_path: str | Path,
+    quantification_run_id: Optional[int] = None,
+    analysis_type: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[AnalysisRun]:
+    """Retrieve analysis runs, optionally filtered.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        quantification_run_id: Filter by parent quantification run ID.
+        analysis_type: Filter by analysis type.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of AnalysisRun records, newest first.
+    """
+    conn = init_db(db_path)
+    try:
+        rows = _get_analysis_runs(
+            conn,
+            quantification_run_id=quantification_run_id,
+            analysis_type=analysis_type,
+            limit=limit,
+        )
+        return [_row_to_analysis_run(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.tool()
+def record_dep_results(
+    db_path: str | Path,
+    analysis_run_id: int,
+    results: list[dict],
+) -> DepResultsWriteResult:
+    """Record differential expression results for an analysis run.
+
+    Bulk-inserts per-feature effect sizes and significance produced by a
+    differential expression analysis run.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        analysis_run_id: ID of the analysis run that produced these results.
+        results: List of dicts, each optionally containing: feature_id,
+            log2fc, pvalue, padj, direction, significant.
+
+    Returns:
+        DepResultsWriteResult with the analysis_run_id, inserted count, and
+        the new row ids.
+    """
+    conn = init_db(db_path)
+    try:
+        ids = insert_dep_results(conn, analysis_run_id=analysis_run_id, results=results)
+        return DepResultsWriteResult(
+            analysis_run_id=analysis_run_id,
+            inserted=len(ids),
+            ids=ids,
+        )
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_dep_results(
+    db_path: str | Path,
+    analysis_run_id: int,
+    significant_only: bool = False,
+    limit: Optional[int] = None,
+) -> list[DepResult]:
+    """Retrieve differential expression results for an analysis run.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        analysis_run_id: The analysis run ID to fetch results for.
+        significant_only: If True, only return significant features.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of DepResult records, ordered by adjusted p-value.
+    """
+    conn = init_db(db_path)
+    try:
+        rows = _get_dep_results(
+            conn,
+            analysis_run_id=analysis_run_id,
+            significant_only=significant_only,
+            limit=limit,
+        )
+        return [_row_to_dep_result(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.tool()
+def record_benchmark_annotation(
+    db_path: str | Path,
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    pmcid: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    annotator: Optional[str] = None,
+    label: Optional[str] = None,
+    category: Optional[str] = None,
+    evidence_text: Optional[str] = None,
+) -> BenchmarkAnnotation:
+    """Record a benchmark (ground-truth) annotation.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        doi: Article DOI.
+        pmid: Article PMID.
+        pmcid: Article PMCID.
+        dataset_id: Associated dataset identifier.
+        annotator: Name/identifier of the annotator.
+        label: The ground-truth label.
+        category: Category/task the label belongs to.
+        evidence_text: Supporting evidence for the annotation.
+
+    Returns:
+        The created BenchmarkAnnotation record, including its new id.
+    """
+    conn = init_db(db_path)
+    try:
+        ann_id = insert_benchmark_annotation(
+            conn,
+            doi=doi,
+            pmid=pmid,
+            pmcid=pmcid,
+            dataset_id=dataset_id,
+            annotator=annotator,
+            label=label,
+            category=category,
+            evidence_text=evidence_text,
+        )
+        rows = _get_benchmark_annotations(conn, limit=None)
+        for r in rows:
+            if r["id"] == ann_id:
+                return _row_to_benchmark_annotation(r)
+        # Fallback: should not happen, but keep a typed return.
+        return BenchmarkAnnotation(id=ann_id)
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_benchmark_annotations(
+    db_path: str | Path,
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    pmcid: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[BenchmarkAnnotation]:
+    """Retrieve benchmark annotations, optionally filtered.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        doi: Filter by article DOI.
+        pmid: Filter by article PMID.
+        pmcid: Filter by article PMCID.
+        dataset_id: Filter by dataset identifier.
+        category: Filter by category.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of BenchmarkAnnotation records, newest first.
+    """
+    conn = init_db(db_path)
+    try:
+        rows = _get_benchmark_annotations(
+            conn,
+            doi=doi,
+            pmid=pmid,
+            pmcid=pmcid,
+            dataset_id=dataset_id,
+            category=category,
+            limit=limit,
+        )
+        return [_row_to_benchmark_annotation(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.tool()
+def record_benchmark_prediction(
+    db_path: str | Path,
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    pmcid: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    predicted_label: Optional[str] = None,
+    confidence: Optional[float] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    run_at: Optional[str] = None,
+) -> BenchmarkPrediction:
+    """Record a benchmark prediction (to be scored against annotations).
+
+    Args:
+        db_path: Path to the SQLite database file.
+        doi: Article DOI.
+        pmid: Article PMID.
+        pmcid: Article PMCID.
+        dataset_id: Associated dataset identifier.
+        predicted_label: The predicted label.
+        confidence: Confidence score for the prediction.
+        model: Model that produced the prediction.
+        provider: Provider of the model (e.g., "azure").
+        run_at: Timestamp when the prediction was produced (ISO format).
+
+    Returns:
+        The created BenchmarkPrediction record, including its new id.
+    """
+    conn = init_db(db_path)
+    try:
+        pred_id = insert_benchmark_prediction(
+            conn,
+            doi=doi,
+            pmid=pmid,
+            pmcid=pmcid,
+            dataset_id=dataset_id,
+            predicted_label=predicted_label,
+            confidence=confidence,
+            model=model,
+            provider=provider,
+            run_at=run_at,
+        )
+        rows = _get_benchmark_predictions(conn, limit=None)
+        for r in rows:
+            if r["id"] == pred_id:
+                return _row_to_benchmark_prediction(r)
+        # Fallback: should not happen, but keep a typed return.
+        return BenchmarkPrediction(id=pred_id)
+    finally:
+        conn.close()
+
+
+@app.tool()
+def get_benchmark_predictions(
+    db_path: str | Path,
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    pmcid: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    model: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[BenchmarkPrediction]:
+    """Retrieve benchmark predictions, optionally filtered.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        doi: Filter by article DOI.
+        pmid: Filter by article PMID.
+        pmcid: Filter by article PMCID.
+        dataset_id: Filter by dataset identifier.
+        model: Filter by model.
+        limit: Maximum number of rows to return.
+
+    Returns:
+        List of BenchmarkPrediction records, newest first.
+    """
+    conn = init_db(db_path)
+    try:
+        rows = _get_benchmark_predictions(
+            conn,
+            doi=doi,
+            pmid=pmid,
+            pmcid=pmcid,
+            dataset_id=dataset_id,
+            model=model,
+            limit=limit,
+        )
+        return [_row_to_benchmark_prediction(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.tool()
+def compute_fidelity_report(
+    reproduced_matrix_path: Optional[str] = None,
+    published_matrix_path: Optional[str] = None,
+    matrix_format: str = "generic",
+    id_column: Optional[str] = None,
+    intensity_columns: Optional[list[str]] = None,
+    sep: Optional[str] = None,
+    log_transform: bool = True,
+    log_base: float = 2.0,
+    pseudocount: float = 0.0,
+    sample_map: Optional[dict] = None,
+    reproduced_dep_path: Optional[str] = None,
+    published_dep_path: Optional[str] = None,
+    dep_id_column: str = "feature_id",
+    dep_log2fc_column: str = "log2fc",
+    dep_pvalue_column: Optional[str] = "pvalue",
+    dep_padj_column: Optional[str] = "padj",
+    dep_significant_column: Optional[str] = "significant",
+    dep_sep: Optional[str] = None,
+    significance_threshold: float = 0.05,
+    lfc_threshold: float = 0.0,
+    use_padj: bool = True,
+    version_a_path: Optional[str] = None,
+    version_b_path: Optional[str] = None,
+    version_a_label: str = "version_a",
+    version_b_label: str = "version_b",
+    version_id_column: Optional[str] = None,
+    include_feature_lists: bool = True,
+    db_path: Optional[str] = None,
+    record: bool = False,
+) -> FidelityReport:
+    """Quantify and decompose how closely a reproduced omics result matches a published one.
+
+    Computes any subset of four comparison sections, depending on which inputs
+    are supplied, using deterministic, network-free, LLM-free math:
+
+    1. Identification overlap (shared / reproduced-only / published-only counts
+       and Jaccard) from the two abundance matrices.
+    2. Quantitative agreement: per-sample and pooled Pearson and Spearman
+       correlations of (optionally log-transformed) intensities on shared
+       features.
+    3. DEP decomposition: overlap of the significant sets plus a four-bucket
+       attribution (concordant, not_quantified, quantified_not_significant,
+       significant_different_direction) of every published-significant feature,
+       explaining the non-reproduced hits.
+    4. Version comparison: gained / lost / shared identifications between two
+       tool versions (e.g. DIA-NN v1.8.1 vs v2.3.1).
+
+    Args:
+        reproduced_matrix_path: Path to the reproduced abundance matrix file.
+        published_matrix_path: Path to the published abundance matrix file.
+        matrix_format: One of "generic", "diann", or "maxquant" (selects the
+            loader and its default column detection).
+        id_column: Feature-id column name (matrix format defaults apply when None).
+        intensity_columns: Explicit list of sample/intensity columns; auto-detected
+            when None.
+        sep: Field delimiter for matrix files; inferred from extension when None.
+        log_transform: Log-transform intensities before correlating. Default True.
+        log_base: Logarithm base used when log_transform is True. Default 2.0.
+        pseudocount: Value added before taking the logarithm. Default 0.0.
+        sample_map: Mapping of reproduced sample name -> published sample name;
+            when None, identically named samples are paired.
+        reproduced_dep_path: Path to the reproduced DEP results file.
+        published_dep_path: Path to the published DEP results file.
+        dep_id_column: DEP feature-id column name.
+        dep_log2fc_column: DEP log2 fold-change column name.
+        dep_pvalue_column: DEP raw p-value column name.
+        dep_padj_column: DEP adjusted p-value column name.
+        dep_significant_column: DEP explicit significance-flag column name.
+        dep_sep: Field delimiter for DEP files; inferred from extension when None.
+        significance_threshold: Threshold for derived DEP significance. Default 0.05.
+        lfc_threshold: Minimum absolute log2 fold change for derived significance.
+        use_padj: Prefer padj over pvalue for derived significance. Default True.
+        version_a_path: Path to identification set for version A (baseline).
+        version_b_path: Path to identification set for version B (comparison).
+        version_a_label: Label for version A.
+        version_b_label: Label for version B.
+        version_id_column: Feature-id column for the version files (falls back to
+            id_column, then the matrix-format default).
+        include_feature_lists: Include per-section feature-id lists. Default True.
+        db_path: Optional SQLite database path used only when record=True.
+        record: If True and db_path is set, persist a compact summary via an
+            analysis_runs record (analysis_type="fidelity"). Failures to record
+            are non-fatal and noted in the report.
+
+    Returns:
+        FidelityReport with the requested sections populated; sections without
+        inputs are left as None. When persisted, recorded_analysis_run_id is set.
+    """
+
+    def _load_matrix_by_format(path: str):
+        if matrix_format == "diann":
+            return load_diann_pg_matrix(
+                path,
+                id_column=id_column or "Protein.Group",
+                intensity_columns=intensity_columns,
+                sep=sep,
+            )
+        if matrix_format == "maxquant":
+            kwargs = {"intensity_columns": intensity_columns, "sep": sep}
+            if id_column:
+                kwargs["id_column"] = id_column
+            return load_maxquant_protein_groups(path, **kwargs)
+        return load_matrix(
+            path,
+            id_column=id_column,
+            intensity_columns=intensity_columns,
+            sep=sep,
+        )
+
+    notes: list[str] = []
+    identification = None
+    quantitative = None
+    dep = None
+    version = None
+
+    reproduced_matrix = None
+    published_matrix = None
+
+    if reproduced_matrix_path and published_matrix_path:
+        reproduced_matrix = _load_matrix_by_format(reproduced_matrix_path)
+        published_matrix = _load_matrix_by_format(published_matrix_path)
+        identification = compare_identifications(
+            reproduced_matrix,
+            published_matrix,
+            include_feature_lists=include_feature_lists,
+        )
+        quantitative = compare_quantitative(
+            reproduced_matrix,
+            published_matrix,
+            sample_map=sample_map,
+            log_transform=log_transform,
+            log_base=log_base,
+            pseudocount=pseudocount,
+        )
+    elif reproduced_matrix_path or published_matrix_path:
+        notes.append(
+            "Both reproduced_matrix_path and published_matrix_path are required "
+            "for identification/quantitative comparison; skipping those sections."
+        )
+
+    if reproduced_dep_path and published_dep_path:
+        reproduced_deps = load_dep_results(
+            reproduced_dep_path,
+            id_column=dep_id_column,
+            log2fc_column=dep_log2fc_column,
+            pvalue_column=dep_pvalue_column,
+            padj_column=dep_padj_column,
+            significant_column=dep_significant_column,
+            sep=dep_sep,
+        )
+        published_deps = load_dep_results(
+            published_dep_path,
+            id_column=dep_id_column,
+            log2fc_column=dep_log2fc_column,
+            pvalue_column=dep_pvalue_column,
+            padj_column=dep_padj_column,
+            significant_column=dep_significant_column,
+            sep=dep_sep,
+        )
+        reproduced_quantified_ids = (
+            list(reproduced_matrix.feature_ids) if reproduced_matrix else None
+        )
+        dep = compare_deps(
+            reproduced_deps,
+            published_deps,
+            reproduced_quantified_ids=reproduced_quantified_ids,
+            significance_threshold=significance_threshold,
+            lfc_threshold=lfc_threshold,
+            use_padj=use_padj,
+            include_feature_lists=include_feature_lists,
+        )
+    elif reproduced_dep_path or published_dep_path:
+        notes.append(
+            "Both reproduced_dep_path and published_dep_path are required for the "
+            "DEP decomposition; skipping that section."
+        )
+
+    if version_a_path and version_b_path:
+        v_id_col = version_id_column or id_column
+        version_a = load_matrix(version_a_path, id_column=v_id_col, sep=sep)
+        version_b = load_matrix(version_b_path, id_column=v_id_col, sep=sep)
+        version = compare_versions(
+            version_a,
+            version_b,
+            label_a=version_a_label,
+            label_b=version_b_label,
+            include_feature_lists=include_feature_lists,
+        )
+    elif version_a_path or version_b_path:
+        notes.append(
+            "Both version_a_path and version_b_path are required for the version "
+            "comparison; skipping that section."
+        )
+
+    report = assemble_report(
+        identification=identification,
+        quantitative=quantitative,
+        dep=dep,
+        version=version,
+        notes=notes,
+    )
+
+    if record and db_path:
+        summary = {
+            "identification": {
+                "n_shared": identification.n_shared,
+                "jaccard": identification.jaccard,
+            }
+            if identification
+            else None,
+            "quantitative": {
+                "pooled_pearson": quantitative.pooled_pearson,
+                "pooled_spearman": quantitative.pooled_spearman,
+            }
+            if quantitative
+            else None,
+            "dep": {
+                "overlap_pct_of_published": dep.overlap_pct_of_published,
+                "not_quantified": dep.not_quantified,
+                "quantified_not_significant": dep.quantified_not_significant,
+                "significant_different_direction": dep.significant_different_direction,
+            }
+            if dep
+            else None,
+            "version": {
+                "n_gained": version.n_gained,
+                "n_lost": version.n_lost,
+            }
+            if version
+            else None,
+        }
+        try:
+            conn = init_db(db_path)
+            try:
+                input_paths = [
+                    p
+                    for p in (
+                        reproduced_matrix_path,
+                        published_matrix_path,
+                        reproduced_dep_path,
+                        published_dep_path,
+                        version_a_path,
+                        version_b_path,
+                    )
+                    if p
+                ]
+                run_id = insert_analysis_run(
+                    conn,
+                    analysis_type="fidelity",
+                    method="fidelity_report",
+                    library="odda_utils.fidelity",
+                    parameters=summary,
+                    input_paths=input_paths,
+                )
+                report.recorded_analysis_run_id = run_id
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            logger.warning("Failed to record fidelity analysis run: %s", exc)
+            report.notes.append(f"Failed to record analysis run: {exc}")
+
+    return report
+
+
+@app.tool()
+def meta_analysis(
+    effects: Optional[list[float]] = None,
+    variances: Optional[list[float]] = None,
+    standard_errors: Optional[list[float]] = None,
+    pvalues: Optional[list[float]] = None,
+    entities: Optional[dict[str, list[dict[str, float]]]] = None,
+    name: str = "effect",
+) -> MetaAnalysisBatchResult:
+    """Statistically combine per-study effect sizes across studies.
+
+    Runs both a fixed-effect (inverse-variance) and a DerSimonian-Laird
+    random-effects meta-analysis, generalizing the system's cross-study
+    comparison into a formal pooled estimate. Two calling styles are supported:
+
+    1. Single entity: pass parallel ``effects`` plus exactly one of
+       ``variances``, ``standard_errors``, or ``pvalues``. Standard errors are
+       squared to variances; p-values are converted to standard errors via
+       SE = |effect| / z (two-sided) and then squared.
+    2. Many entities at once (the typical use for proteins/genes): pass
+       ``entities`` mapping each entity name to a list of per-study records.
+       Each record is a dict with an effect key ("yi"/"effect"/"effect_size"/
+       "es"/"log2fc"/"logfc") and one uncertainty key (a variance "vi"/
+       "variance"/"var", a standard error "se"/"standard_error"/"std_error", or
+       a p-value "p"/"pvalue"/"p_value"/"pval"). Per-entity errors are captured
+       on that entity's result and do not abort the batch.
+
+    When ``entities`` is provided it takes precedence over the single-entity
+    arguments. Studies with a non-finite effect or a non-positive variance are
+    dropped before pooling.
+
+    Args:
+        effects: Per-study effect sizes for a single entity (e.g. log2 fold
+            changes).
+        variances: Per-study variances (SE**2). Mutually exclusive with
+            standard_errors and pvalues.
+        standard_errors: Per-study standard errors.
+        pvalues: Per-study two-sided p-values.
+        entities: Mapping of entity name to a list of per-study record dicts,
+            for meta-analyzing many entities in one call.
+        name: Label for the single-entity result (default "effect").
+
+    Returns:
+        MetaAnalysisBatchResult keyed by entity name. Each MetaAnalysisResult
+        holds the number of pooled studies (k), the fixed- and random-effects
+        pooled estimates (estimate, se, 95% CI, and z/p for random effects), and
+        heterogeneity statistics (Q, Q_p, df, I2, tau2). Entities that could not
+        be analyzed carry an ``error`` message and k = 0.
+    """
+    if entities is not None:
+        return _run_meta_analysis_batch(entities)
+    single = _run_meta_analysis(
+        effects=effects,
+        variances=variances,
+        standard_errors=standard_errors,
+        pvalues=pvalues,
+        name=name,
+    )
+    return MetaAnalysisBatchResult(
+        results={single.name or name: single},
+        n_entities=1,
+        n_succeeded=0 if single.error else 1,
+        n_failed=1 if single.error else 0,
+    )
+
+
+@app.tool()
+def scan_injection(
+    text: Optional[str] = None,
+    source_label: Optional[str] = None,
+    items: Optional[dict[str, str]] = None,
+    flag_threshold: float = 40.0,
+    snippet_len: int = 160,
+    include_snippets: bool = True,
+    max_matches_per_category: int = 50,
+    min_base64_len: int = 48,
+    max_chars: Optional[int] = 2_000_000,
+) -> InjectionScanBatchResult:
+    """Scan untrusted article/supplemental text for prompt-injection patterns.
+
+    Defensive telemetry for the ODDA trust boundary. Extracted text from an
+    article and its supplements is untrusted input; this tool measures it for
+    instruction-like / command-injection patterns directed at an AI so that
+    suspicious inputs can be flagged for human review and the signal stored as a
+    provenance field. It is pure and side-effect-free: it NEVER executes,
+    follows, downloads, or otherwise acts on the scanned content -- it only
+    counts matches and computes a bounded risk score.
+
+    Detected pattern categories:
+    - instruction_override ("ignore previous instructions", "disregard", "forget")
+    - role_manipulation ("as an AI", "system prompt", "developer mode", "jailbreak")
+    - imperative_to_ai ("you must", "you should", "make sure to", "do not reveal")
+    - database_manipulation ("add the keyword", "insert into", "classify as")
+    - tool_command_injection (os.system(, subprocess, eval(, rm -rf, curl ... | sh)
+    - url_exfiltration (URLs, "send/upload the data to ...", IP addresses)
+    - encoded_payload (base64 blobs, long hex strings, \\x escapes, data: URIs)
+
+    Two calling styles are supported (both return the same batch container so
+    callers can treat the output uniformly):
+
+    1. Single text: pass ``text`` (and optionally ``source_label``). The result
+       is keyed by ``source_label`` (or ``"text"``).
+    2. Many texts at once (typical: main text plus each supplemental file): pass
+       ``items`` mapping a label (filename or ``"main_text"``) to its text.
+       Per-item errors are captured on that item and do not abort the batch.
+
+    When both are given, ``items`` takes precedence.
+
+    This is deterministic pattern telemetry, not a classifier; false positives
+    (e.g. a methods section literally discussing a "system prompt") are expected
+    and acceptable because the signal only gates human review, never an
+    automated action on the untrusted text.
+
+    Args:
+        text: A single text to scan (single-text style).
+        source_label: Label for the single text (e.g. a DOI or filename).
+        items: Mapping of label -> text for scanning many texts at once.
+        flag_threshold: risk_score at/above which an item is counted as flagged
+            (default 40.0, the medium-risk cutoff).
+        snippet_len: Maximum length of each returned match snippet.
+        include_snippets: If False, omit match snippets (offsets/counts remain),
+            so the signal can be stored without echoing the payload.
+        max_matches_per_category: Cap on retained spans per category (the
+            reported count is still the true total).
+        min_base64_len: Minimum base64-like run length to flag as encoded_payload.
+        max_chars: Only the leading max_chars characters are scanned (None to
+            scan everything).
+
+    Returns:
+        InjectionScanBatchResult keyed by item label. Each InjectionScanResult
+        holds per-category counts and matched spans, the matched-category list,
+        an unbounded weighted_score, a bounded risk_score in [0, 100], and a
+        coarse risk_level ("none"/"low"/"medium"/"high"). The batch adds flag
+        and error counts and the list of flagged labels.
+    """
+    if items is not None:
+        return _scan_injection_batch(
+            items,
+            flag_threshold=flag_threshold,
+            snippet_len=snippet_len,
+            include_snippets=include_snippets,
+            max_matches_per_category=max_matches_per_category,
+            min_base64_len=min_base64_len,
+            max_chars=max_chars,
+        )
+    label = source_label or "text"
+    return _scan_injection_batch(
+        {label: text or ""},
+        flag_threshold=flag_threshold,
+        snippet_len=snippet_len,
+        include_snippets=include_snippets,
+        max_matches_per_category=max_matches_per_category,
+        min_base64_len=min_base64_len,
+        max_chars=max_chars,
+    )
 
 
 def main():

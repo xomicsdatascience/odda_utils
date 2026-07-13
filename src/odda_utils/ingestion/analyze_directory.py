@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from openai import AzureOpenAI
+from odda_utils import llm
 
 from odda_utils.database import (
     get_dataset,
@@ -30,6 +30,16 @@ from odda_utils.database import (
 from odda_utils.utils import AzureCredentialsError, get_azure_credentials
 
 logger = logging.getLogger(__name__)
+
+# System prompts for LLM-based file classification.
+_CLASSIFY_SHALLOW_SYSTEM_PROMPT = (
+    "You are a scientific data classification assistant. Classify files from "
+    "omics datasets into categories. Return results as JSON."
+)
+_CLASSIFY_DEEP_SYSTEM_PROMPT = (
+    "You are a scientific data classification assistant. Classify files from "
+    "omics datasets into categories."
+)
 
 # File classification categories for omics datasets
 FileCategory = Literal[
@@ -813,51 +823,22 @@ def _classify_batch_shallow_llm(
     """
     prompt = _build_shallow_llm_prompt(filenames, article_abstract)
 
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     classifications = []
 
     try:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a scientific data classification assistant. "
-                        "Classify files from omics datasets into categories. "
-                        "Return results as JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=10000,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            if "max_completion_tokens" in str(e) or "unsupported_parameter" in str(e):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a scientific data classification assistant. "
-                            "Classify files from omics datasets into categories. "
-                            "Return results as JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=10000,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                raise
-
-        response_text = response.choices[0].message.content
-        result = json.loads(response_text)
+        completion = llm.complete_json(
+            prompt,
+            system=_CLASSIFY_SHALLOW_SYSTEM_PROMPT,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            api_version=api_version,
+            max_tokens=10000,
+        )
+        model = completion.model or model
+        result = completion.data
+        if result is None:
+            result = json.loads(completion.text)
 
         # Handle response format
         if isinstance(result, dict):
@@ -962,47 +943,20 @@ def classify_file_deep_llm(
     file_header = get_file_header(file_path)
     prompt = _build_deep_llm_prompt(filename, file_header, article_abstract)
 
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     try:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a scientific data classification assistant. "
-                        "Classify files from omics datasets into categories.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=1024,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            if "max_completion_tokens" in str(e) or "unsupported_parameter" in str(e):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a scientific data classification assistant. "
-                            "Classify files from omics datasets into categories.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=1024,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                raise
-
-        response_text = response.choices[0].message.content
-        result = json.loads(response_text)
+        completion = llm.complete_json(
+            prompt,
+            system=_CLASSIFY_DEEP_SYSTEM_PROMPT,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            api_version=api_version,
+            max_tokens=1024,
+        )
+        model = completion.model or model
+        result = completion.data
+        if result is None:
+            result = json.loads(completion.text)
 
         category = result.get("category", "unknown")
         reason = result.get("reason", "LLM classification")
@@ -1076,47 +1030,20 @@ def _classify_file_deep_llm_with_header(
     """
     prompt = _build_deep_llm_prompt(filename, file_header, article_abstract)
 
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     try:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a scientific data classification assistant. "
-                        "Classify files from omics datasets into categories.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=1024,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            if "max_completion_tokens" in str(e) or "unsupported_parameter" in str(e):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a scientific data classification assistant. "
-                            "Classify files from omics datasets into categories.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=1024,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                raise
-
-        response_text = response.choices[0].message.content
-        result = json.loads(response_text)
+        completion = llm.complete_json(
+            prompt,
+            system=_CLASSIFY_DEEP_SYSTEM_PROMPT,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            api_version=api_version,
+            max_tokens=1024,
+        )
+        model = completion.model or model
+        result = completion.data
+        if result is None:
+            result = json.loads(completion.text)
 
         category = result.get("category", "unknown")
         reason = result.get("reason", "LLM classification")
@@ -1214,13 +1141,21 @@ def analyze_directory(
         result.error = f"Path is not a directory: {directory_path}"
         return result
 
-    # Get Azure credentials if LLM is enabled
+    # Resolve credentials if LLM is enabled. Azure OpenAI credentials are treated
+    # as optional legacy hints; the actual chat provider is resolved by
+    # odda_utils.llm. LLM passes are only disabled if no provider is configured.
     endpoint = None
     api_key = None
+    llm_available = False
     if use_shallow_llm or use_deep_llm:
         try:
             endpoint, api_key = get_azure_credentials(endpoint_file, api_key_file)
-        except AzureCredentialsError as e:
+        except AzureCredentialsError:
+            endpoint, api_key = None, None
+        try:
+            llm.resolve_chat_config(endpoint=endpoint, api_key=api_key)
+            llm_available = True
+        except llm.ModelConfigError as e:
             logger.warning("LLM classification disabled: %s", e)
             use_shallow_llm = False
             use_deep_llm = False
@@ -1305,7 +1240,7 @@ def analyze_directory(
     shallow_llm_classifications = {}
     still_unknown_files = []
 
-    if unknown_files and use_shallow_llm and endpoint and api_key:
+    if unknown_files and use_shallow_llm and llm_available:
         unknown_filenames = [rel_path for _, rel_path, _, _, _ in unknown_files]
         llm_results = classify_files_shallow_llm(
             filenames=unknown_filenames,
@@ -1328,7 +1263,7 @@ def analyze_directory(
     # Third pass: deep LLM classification (when enabled)
     deep_llm_classifications = {}
 
-    if still_unknown_files and use_deep_llm and endpoint and api_key:
+    if still_unknown_files and use_deep_llm and llm_available:
         for file_path, rel_path, archive_path, internal_path, size_bytes in still_unknown_files:
             # Get file header - either from archive or directly
             if archive_path is not None and internal_path is not None:

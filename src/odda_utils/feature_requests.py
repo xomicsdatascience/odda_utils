@@ -3,6 +3,7 @@
 # The 'incomplete' status is used when a feature cannot be fully implemented due to external
 # dependencies or other blockers.
 
+import asyncio
 import sqlite3
 import struct
 from dataclasses import dataclass
@@ -10,8 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import httpx
 import numpy as np
+
+from odda_utils import llm
 
 
 DEFAULT_DB_PATH = Path("./articles.sqlite")
@@ -140,43 +142,6 @@ def _blob_to_embedding(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{count}f", blob))
 
 
-def _get_azure_credentials(
-    endpoint_file: Path | None = None,
-    api_key_file: Path | None = None,
-) -> tuple[str, str]:
-    """Get Azure OpenAI credentials from files.
-
-    Parameters
-    ----------
-    endpoint_file : Path | None
-        Path to file containing the Azure OpenAI endpoint URL.
-    api_key_file : Path | None
-        Path to file containing the Azure OpenAI API key.
-
-    Returns
-    -------
-    tuple[str, str]
-        Tuple of (endpoint, api_key).
-
-    Raises
-    ------
-    FileNotFoundError
-        If credential files cannot be found.
-    """
-    endpoint_path = endpoint_file or DEFAULT_ENDPOINT_FILE
-    api_key_path = api_key_file or DEFAULT_API_KEY_FILE
-
-    if not endpoint_path.exists():
-        raise FileNotFoundError(f"Endpoint file not found: {endpoint_path}")
-    if not api_key_path.exists():
-        raise FileNotFoundError(f"API key file not found: {api_key_path}")
-
-    endpoint = endpoint_path.read_text().strip()
-    api_key = api_key_path.read_text().strip()
-
-    return endpoint, api_key
-
-
 async def get_text_embedding_async(
     text: str,
     endpoint_file: Path | None = None,
@@ -184,7 +149,16 @@ async def get_text_embedding_async(
     deployment_name: str = "text-embedding-3-small",
     api_version: str = "2024-02-01",
 ) -> list[float]:
-    """Get text embedding from Azure OpenAI asynchronously.
+    """Get a text embedding via the configured embedding provider, asynchronously.
+
+    Delegates to the provider-agnostic :mod:`odda_utils.llm` abstraction (run in a
+    worker thread since ``llm.embed`` is synchronous). This replaces the module's
+    former duplicate Azure-credential reader and direct Azure embeddings URL. The
+    ``endpoint_file`` / ``api_key_file`` / ``deployment_name`` / ``api_version``
+    arguments are Azure-OpenAI hints, honoured only when the resolved embedding
+    provider is ``azure_openai``. For backward compatibility, if no credential
+    files are supplied, the default ``.claude/azure.endpoint`` /
+    ``.claude/azure.key`` files are used when they exist.
 
     Parameters
     ----------
@@ -195,7 +169,7 @@ async def get_text_embedding_async(
     api_key_file : Path | None
         Path to file containing the Azure OpenAI API key.
     deployment_name : str
-        Name of the embedding model deployment in Azure.
+        Name of the embedding model deployment (azure_openai).
     api_version : str
         Azure OpenAI API version.
 
@@ -206,24 +180,27 @@ async def get_text_embedding_async(
 
     Raises
     ------
-    httpx.HTTPError
-        If the API request fails.
+    odda_utils.llm.ModelConfigError
+        If no embedding provider is configured.
+    odda_utils.llm.LLMProviderError
+        If the embedding request fails.
     """
-    endpoint, api_key = _get_azure_credentials(endpoint_file, api_key_file)
+    # Preserve the historical default of reading credentials from .claude/ files
+    # when present, while otherwise deferring to the canonical config/env path.
+    if endpoint_file is None and DEFAULT_ENDPOINT_FILE.exists():
+        endpoint_file = DEFAULT_ENDPOINT_FILE
+    if api_key_file is None and DEFAULT_API_KEY_FILE.exists():
+        api_key_file = DEFAULT_API_KEY_FILE
 
-    url = f"{endpoint}/openai/deployments/{deployment_name}/embeddings"
-    params = {"api-version": api_version}
-    headers = {"api-key": api_key, "Content-Type": "application/json"}
-    payload = {"input": text}
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            url, params=params, headers=headers, json=payload, timeout=30.0
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    return data["data"][0]["embedding"]
+    result = await asyncio.to_thread(
+        llm.embed,
+        text,
+        endpoint_file=endpoint_file,
+        api_key_file=api_key_file,
+        model=deployment_name,
+        api_version=api_version,
+    )
+    return result.vector
 
 
 def _cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:

@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openai import AzureOpenAI
+from odda_utils import llm
 
 from odda_utils.database import (
     get_article,
@@ -140,6 +140,12 @@ def build_extraction_prompt(
     return "\n\n".join(parts)
 
 
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a scientific data extraction assistant. Extract structured "
+    "information from scientific articles and return the results as valid JSON."
+)
+
+
 def call_llm(
     prompt: str,
     endpoint: str,
@@ -149,16 +155,22 @@ def call_llm(
     max_tokens: int = 16384,
     temperature: float = 1.0,
 ) -> str:
-    """Call Azure OpenAI LLM with the given prompt.
+    """Call the configured chat LLM with the given prompt.
+
+    Delegates to the provider-agnostic :mod:`odda_utils.llm` abstraction. The
+    ``endpoint``, ``api_key``, ``model`` and ``api_version`` arguments are
+    Azure-OpenAI hints preserved for backward compatibility; they are honoured
+    only when the resolved chat provider is ``azure_openai``. For other
+    providers (e.g. Claude via Azure) the configured credentials/model are used.
 
     Args:
         prompt: The prompt to send to the LLM.
-        endpoint: Azure OpenAI endpoint URL.
-        api_key: Azure OpenAI API key.
-        model: Name of the model deployment in Azure.
+        endpoint: Azure OpenAI endpoint URL (azure_openai hint).
+        api_key: Azure OpenAI API key (azure_openai hint).
+        model: Name of the model deployment (azure_openai hint).
         api_version: Azure OpenAI API version.
         max_tokens: Maximum tokens in the response.
-        temperature: Sampling temperature (0.0 for deterministic).
+        temperature: Sampling temperature (OpenAI-family providers only).
 
     Returns:
         The LLM response text.
@@ -166,53 +178,20 @@ def call_llm(
     Raises:
         LLMExtractionError: If the LLM call fails.
     """
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     try:
-        # Try with max_completion_tokens first (newer API format)
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a scientific data extraction assistant. "
-                        "Extract structured information from scientific articles and "
-                        "return the results as valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=max_tokens,
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            # Fall back to max_tokens for older models
-            if "max_completion_tokens" in str(e) or "unsupported_parameter" in str(e):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a scientific data extraction assistant. "
-                            "Extract structured information from scientific articles and "
-                            "return the results as valid JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                raise
-        return response.choices[0].message.content
+        result = llm.complete_json(
+            prompt,
+            system=_EXTRACTION_SYSTEM_PROMPT,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            api_version=api_version,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
     except Exception as e:
         raise LLMExtractionError(f"LLM call failed: {e}") from e
+    return result.text
 
 
 def parse_llm_response(response: str, model: str) -> ExtractedMetadata:

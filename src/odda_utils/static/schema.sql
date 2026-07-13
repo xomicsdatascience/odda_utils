@@ -474,3 +474,142 @@ CREATE INDEX IF NOT EXISTS idx_uniprot_fasta_tax_id ON uniprot_fasta(tax_id);
 CREATE INDEX IF NOT EXISTS idx_uniprot_fasta_oscode ON uniprot_fasta(oscode);
 CREATE INDEX IF NOT EXISTS idx_uniprot_fasta_superregnum ON uniprot_fasta(superregnum);
 CREATE INDEX IF NOT EXISTS idx_uniprot_fasta_species ON uniprot_fasta(species_name);
+
+-- ===========================================================================
+-- Provenance / research-object layer (Phase 2)
+-- These tables make every quantification/analysis result a reproducible
+-- research object by stamping tool versions, container/parameter hashes,
+-- commands, hosts, and model/provider provenance. All tables are additive
+-- (CREATE TABLE IF NOT EXISTS) and do not modify existing tables.
+--
+-- NOTE (migration): the existing llm_* tables (llm_raw_data, llm_processed_data,
+-- llm_analysis_methods, llm_code, llm_keywords, llm_extractions) predate the
+-- provider/run_at provenance columns used below. Because a CREATE TABLE
+-- IF NOT EXISTS is a no-op against an already-populated database, adding
+-- provider/run_at to those tables here would NOT take effect on the live
+-- articles.sqlite. Backfilling those columns requires an explicit ALTER TABLE
+-- migration and is intentionally left out of this schema.
+-- ===========================================================================
+
+-- Quantification runs table
+-- One row per execution of an omic quantification tool (e.g., DIA-NN, MaxQuant)
+-- against a dataset. Captures full provenance for reproducibility: tool version,
+-- container image + digest, parameter file + hash, command line, input files,
+-- output directory, exit status, wall time, host, and (optional) LLM
+-- model/provider used to derive parameters.
+CREATE TABLE IF NOT EXISTS quantification_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id VARCHAR(50),
+    tool VARCHAR(100),
+    tool_version VARCHAR(100),
+    container_image TEXT,
+    container_sha256 VARCHAR(64),
+    param_file_path TEXT,
+    param_file_sha256 VARCHAR(64),
+    command TEXT,
+    input_files_json TEXT,
+    output_dir TEXT,
+    exit_status INTEGER,
+    wall_time_sec REAL,
+    host TEXT,
+    extraction_model VARCHAR(100),
+    provider VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_quant_runs_dataset_id ON quantification_runs(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_quant_runs_tool ON quantification_runs(tool);
+CREATE INDEX IF NOT EXISTS idx_quant_runs_created ON quantification_runs(created_at);
+
+-- Analysis runs table
+-- One row per downstream analysis (QC, differential expression (DE),
+-- enrichment, etc.) performed on quantified data. Optionally links back to the
+-- quantification_run that produced its inputs. Captures method/library
+-- versions, parameters, code hash, random seed, input/output paths, and
+-- model/provider provenance.
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quantification_run_id INTEGER REFERENCES quantification_runs(id),
+    analysis_type VARCHAR(50),
+    method VARCHAR(200),
+    library VARCHAR(200),
+    library_version VARCHAR(100),
+    parameters_json TEXT,
+    code_sha256 VARCHAR(64),
+    random_seed INTEGER,
+    input_paths_json TEXT,
+    output_paths_json TEXT,
+    provider VARCHAR(100),
+    model VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_quant_run ON analysis_runs(quantification_run_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_type ON analysis_runs(analysis_type);
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_created ON analysis_runs(created_at);
+
+-- Differential expression (DE/DEP) results table
+-- One row per feature (protein/peptide/gene) per analysis run, storing the
+-- effect size and significance. Linked to the analysis_run that produced it.
+CREATE TABLE IF NOT EXISTS dep_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_run_id INTEGER REFERENCES analysis_runs(id),
+    feature_id TEXT,
+    log2fc REAL,
+    pvalue REAL,
+    padj REAL,
+    direction VARCHAR(10),
+    significant BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_dep_results_analysis_run ON dep_results(analysis_run_id);
+CREATE INDEX IF NOT EXISTS idx_dep_results_feature ON dep_results(feature_id);
+CREATE INDEX IF NOT EXISTS idx_dep_results_significant ON dep_results(significant);
+
+-- Benchmark annotations table
+-- Human/ground-truth labels used to evaluate predictions. Linked to an article
+-- (doi/pmid/pmcid) and/or a dataset, with an annotator, label, category, and
+-- supporting evidence text.
+CREATE TABLE IF NOT EXISTS benchmark_annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi VARCHAR(40),
+    pmid VARCHAR(30),
+    pmcid VARCHAR(30),
+    dataset_id VARCHAR(50),
+    annotator TEXT,
+    label TEXT,
+    category VARCHAR(100),
+    evidence_text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_benchmark_annotations_doi ON benchmark_annotations(doi);
+CREATE INDEX IF NOT EXISTS idx_benchmark_annotations_pmid ON benchmark_annotations(pmid);
+CREATE INDEX IF NOT EXISTS idx_benchmark_annotations_pmcid ON benchmark_annotations(pmcid);
+CREATE INDEX IF NOT EXISTS idx_benchmark_annotations_dataset ON benchmark_annotations(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_annotations_category ON benchmark_annotations(category);
+
+-- Benchmark predictions table
+-- Model-generated predictions to be compared against benchmark_annotations.
+-- Linked to an article (doi/pmid/pmcid) and/or a dataset, with a predicted
+-- label, confidence, and model/provider provenance plus a run timestamp.
+CREATE TABLE IF NOT EXISTS benchmark_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi VARCHAR(40),
+    pmid VARCHAR(30),
+    pmcid VARCHAR(30),
+    dataset_id VARCHAR(50),
+    predicted_label TEXT,
+    confidence REAL,
+    model VARCHAR(100),
+    provider VARCHAR(100),
+    run_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_doi ON benchmark_predictions(doi);
+CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_pmid ON benchmark_predictions(pmid);
+CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_pmcid ON benchmark_predictions(pmcid);
+CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_dataset ON benchmark_predictions(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_model ON benchmark_predictions(model);

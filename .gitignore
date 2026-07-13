@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Local data / secrets
+*.sqlite
+*.sqlite-journal
+.env
+*.key
+.claude/*.key
+.claude/*.endpoint
