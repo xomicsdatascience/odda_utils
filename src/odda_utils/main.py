@@ -142,6 +142,10 @@ from odda_utils.injection_scan import (
     CategorySignal,
     InjectionMatch,
 )
+from odda_utils.sandbox import (
+    run_analysis_sandboxed as _run_analysis_sandboxed,
+    list_analysis_versions as _list_analysis_versions,
+)
 
 logger = logging.getLogger(__name__)
 app = FastMCP("odda")
@@ -3445,6 +3449,151 @@ def scan_injection(
         min_base64_len=min_base64_len,
         max_chars=max_chars,
     )
+
+
+@app.tool()
+def list_analysis_versions() -> dict:
+    """List analysis-sandbox container versions available on this host.
+
+    The analysis sandbox is the read-only, network-isolated Apptainer container
+    in which agent-synthesized downstream-analysis code is executed (see
+    ``run_analysis``). Images are built from ``static/apptainer/analysis.def``
+    via ``build_images.sh``.
+
+    Returns:
+        dict: ``{"ok": True, "versions": [...], "sif_dir": <str>}``, newest
+        version first. An empty ``versions`` list means no image has been built
+        yet; run ``odda_utils/static/apptainer/build_images.sh``.
+    """
+    return _list_analysis_versions()
+
+
+@app.tool()
+async def run_analysis(
+    work_dir: str,
+    script: str,
+    dataset_paths: Optional[list[str]] = None,
+    approved_code_sha256: Optional[str] = None,
+    analysis_type: Optional[str] = None,
+    cpu_seconds: Optional[int] = None,
+    memory_mb: Optional[int] = 4096,
+    max_file_mb: Optional[int] = 2048,
+    wall_clock_sec: Optional[int] = 3600,
+    max_output_bytes: int = 1_000_000,
+    allow_network: bool = False,
+    version: Optional[str] = None,
+    db_path: Optional[str] = None,
+    quantification_run_id: Optional[int] = None,
+) -> dict:
+    """Execute agent-synthesized analysis code inside a least-privilege sandbox.
+
+    This is the ONLY sanctioned way to run downstream-analysis code (QC,
+    differential expression, enrichment, cross-study synthesis) that was derived
+    from untrusted article text. Such code is treated as untrusted until a human
+    has read it, so this tool is deliberately two-phase and confines execution to
+    a hardened Apptainer container (SECURITY_THREAT_MODEL.md section 5):
+
+    * ``--containall --no-home`` -- no host filesystems, clean env, and no
+      ``$HOME`` mount, so credentials in ``~/.claude`` are never visible.
+    * ``--net --network none`` -- network egress disabled by default. If the
+      host cannot isolate the network unprivileged, the run FAILS CLOSED rather
+      than running with host networking (override only with
+      ``allow_network=True``).
+    * read-only root filesystem; the ONLY writable path is ``work_dir`` (mounted
+      at ``/work``). Named datasets are mounted read-only under ``/data/in/``.
+    * CPU-time / memory / file-size caps via ``ulimit``, a wall-clock timeout,
+      and a cap on captured output.
+
+    Two-phase, review-gated usage:
+
+    1. **Preview (default).** Call WITHOUT ``approved_code_sha256``. The tool
+       hashes the ``*.py`` code under ``work_dir``, scans it with the injection
+       telemetry, and returns the hash and the exact command that would run --
+       but does NOT execute. Surface the code and hash for human review.
+    2. **Execute.** Re-call with ``approved_code_sha256`` set to the hash from
+       step 1. If the code changed since review the hash will not match and the
+       run is refused.
+
+    Args:
+        work_dir: Absolute host path to the run directory (mounted read-write at
+            ``/work``). Holds the analysis code and receives outputs. Paths that
+            look like credential/database locations are refused.
+        script: Entry script relative to ``work_dir`` (e.g.
+            ``analysis_scratch/de.py``). Inside the container, reference input
+            data at ``/data/in/<name>`` and write outputs under ``/work``.
+        dataset_paths: Host dataset files/dirs to bind read-only under
+            ``/data/in/<basename>``. Only these are visible to the code.
+        approved_code_sha256: The reviewed code hash. Omit for a preview.
+        analysis_type: Optional label for provenance (e.g. "QC", "DE",
+            "enrichment", "synthesis").
+        cpu_seconds: CPU-time cap (``ulimit -t``); None to omit.
+        memory_mb: Address-space cap in MiB (``ulimit -v``); None/0 to disable
+            (disable if it interferes with numpy/pandas allocation).
+        max_file_mb: Per-file size cap in MiB (``ulimit -f``); None/0 to omit.
+        wall_clock_sec: Hard wall-clock timeout; the process is killed on expiry.
+        max_output_bytes: Cap on captured stdout/stderr bytes (each; excess is
+            dropped and flagged).
+        allow_network: Escape hatch to run WITHOUT network isolation. Leave False
+            for untrusted code.
+        version: Analysis image version; newest available if omitted.
+        db_path: If given, record a provenance row (analysis run) on successful
+            execution and return its ``analysis_run_id``.
+        quantification_run_id: Optional parent quantification run for provenance.
+
+    Returns:
+        dict: Always has ``ok`` and ``mode`` ("preview" | "executed" |
+        "rejected"). Preview includes ``code_sha256``, ``code_files``,
+        ``injection_scan``, ``image``, and ``planned_command``. Execution
+        includes ``exit_code``, ``stdout``, ``stderr``, ``timed_out``,
+        truncation flags, ``code_sha256``, ``sif_version``, and (with ``db_path``)
+        ``analysis_run_id``.
+    """
+    result = await _run_analysis_sandboxed(
+        work_dir,
+        script,
+        dataset_paths=dataset_paths,
+        approved_code_sha256=approved_code_sha256,
+        cpu_seconds=cpu_seconds,
+        memory_mb=memory_mb,
+        max_file_mb=max_file_mb,
+        wall_clock_sec=wall_clock_sec,
+        max_output_bytes=max_output_bytes,
+        allow_network=allow_network,
+        version=version,
+    )
+
+    # Record provenance only when code actually executed and a DB was provided.
+    if db_path and result.get("mode") == "executed":
+        try:
+            conn = init_db(db_path)
+            try:
+                run_id = insert_analysis_run(
+                    conn,
+                    analysis_type=analysis_type,
+                    method="sandboxed_apptainer",
+                    quantification_run_id=quantification_run_id,
+                    library="apptainer",
+                    library_version=result.get("sif_version"),
+                    parameters={
+                        "script": script,
+                        "cpu_seconds": cpu_seconds,
+                        "memory_mb": memory_mb,
+                        "max_file_mb": max_file_mb,
+                        "wall_clock_sec": wall_clock_sec,
+                        "network_isolated": result.get("network_isolated"),
+                        "exit_code": result.get("exit_code"),
+                    },
+                    code_sha256=result.get("code_sha256"),
+                    input_paths=result.get("input_paths"),
+                    output_paths=result.get("output_paths"),
+                )
+            finally:
+                conn.close()
+            result["analysis_run_id"] = run_id
+        except Exception as e:  # provenance failure must not mask the run result
+            result["provenance_error"] = f"failed to record analysis run: {e}"
+
+    return result
 
 
 def main():

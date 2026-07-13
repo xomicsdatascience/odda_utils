@@ -16,3 +16,7 @@ venv/
 *.key
 .claude/*.key
 .claude/*.endpoint
+
+# Built Apptainer images (large; rebuild from static/apptainer/*.def).
+# The definition files and build scripts ARE tracked; the .sif images are not.
+*.sif
