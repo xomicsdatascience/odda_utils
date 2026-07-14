@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -194,6 +195,127 @@ def call_llm(
     return result.text
 
 
+# Mapping of canonical data-entry field names to the set of normalized key
+# variants an LLM might emit for that field. Keys are normalized with
+# ``_normalize_key`` (lowercased, non-alphanumeric runs collapsed to a single
+# underscore) before lookup, so entries such as ``"dataset ID"``,
+# ``"Dataset-Id"`` or ``"data repository"`` all resolve to their canonical name.
+_ENTRY_KEY_ALIASES: dict[str, set[str]] = {
+    "dataset_id": {
+        "dataset_id",
+        "datasetid",
+        "dataset",
+        "dataset_accession",
+        "dataset_identifier",
+        "dataset_number",
+        "accession",
+        "accession_number",
+        "accession_no",
+        "accession_id",
+        "identifier",
+        "id",
+        "data_id",
+    },
+    "data_repository": {
+        "data_repository",
+        "repository",
+        "repo",
+        "database",
+        "data_repo",
+        "database_name",
+        "repository_name",
+        "source_repository",
+        "data_source",
+        "source",
+    },
+    "url": {
+        "url",
+        "uri",
+        "link",
+        "web_link",
+        "weblink",
+        "hyperlink",
+        "address",
+    },
+    "file": {
+        "file",
+        "filename",
+        "file_name",
+        "files",
+        "file_path",
+    },
+    "evidence_text": {
+        "evidence_text",
+        "evidence",
+        "evidence_quote",
+        "quote",
+        "supporting_text",
+        "evidence_sentence",
+    },
+}
+
+# Reverse lookup from a normalized key variant to its canonical field name.
+_ALIAS_TO_CANONICAL: dict[str, str] = {
+    variant: canonical
+    for canonical, variants in _ENTRY_KEY_ALIASES.items()
+    for variant in variants
+}
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a JSON key for tolerant matching.
+
+    Lowercases the key and collapses every run of non-alphanumeric characters
+    (spaces, hyphens, punctuation) into a single underscore, then strips
+    leading/trailing underscores. For example ``"Dataset ID"`` and
+    ``"dataset-id"`` both normalize to ``"dataset_id"``.
+
+    Parameters
+    ----------
+    key : str
+        The raw key from the LLM response.
+
+    Returns
+    -------
+    str
+        The normalized key.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+
+
+def _normalize_entry_keys(entry: dict) -> dict:
+    """Resolve an entry's keys to canonical data-entry field names.
+
+    Each key is normalized with :func:`_normalize_key` and mapped through
+    :data:`_ALIAS_TO_CANONICAL`. Keys without a known alias are retained under
+    their normalized form so no data is silently lost. When multiple source
+    keys resolve to the same canonical field, the first non-empty value wins,
+    which preserves the exact snake_case value if it is present.
+
+    Parameters
+    ----------
+    entry : dict
+        A single raw or processed data entry from the LLM response.
+
+    Returns
+    -------
+    dict
+        A mapping of canonical (or normalized) field names to values.
+    """
+    normalized: dict = {}
+    for raw_key, value in entry.items():
+        norm = _normalize_key(raw_key)
+        canonical = _ALIAS_TO_CANONICAL.get(norm, norm)
+        existing = normalized.get(canonical)
+        # Keep the first value seen for a canonical field, but let a non-empty
+        # value replace a previously stored empty/None one.
+        if canonical not in normalized or (
+            existing in (None, "") and value not in (None, "")
+        ):
+            normalized[canonical] = value
+    return normalized
+
+
 def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
     """Parse and validate the LLM JSON response.
 
@@ -228,31 +350,39 @@ def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
         raw_data = data["raw_data"]
         if isinstance(raw_data, list):
             for entry in raw_data:
-                if isinstance(entry, dict) and "dataset_id" in entry:
-                    result.raw_data.append(
-                        RawDataEntry(
-                            dataset_id=str(entry.get("dataset_id", "")),
-                            data_repository=str(entry.get("data_repository", "")),
-                            url=entry.get("url"),
-                            evidence_text=entry.get("evidence_text"),
-                        )
+                if not isinstance(entry, dict):
+                    continue
+                norm = _normalize_entry_keys(entry)
+                if "dataset_id" not in norm:
+                    continue
+                result.raw_data.append(
+                    RawDataEntry(
+                        dataset_id=str(norm.get("dataset_id") or ""),
+                        data_repository=str(norm.get("data_repository") or ""),
+                        url=norm.get("url"),
+                        evidence_text=norm.get("evidence_text"),
                     )
+                )
 
     # Parse processed data
     if "processed_data" in data:
         processed_data = data["processed_data"]
         if isinstance(processed_data, list):
             for entry in processed_data:
-                if isinstance(entry, dict) and "dataset_id" in entry:
-                    result.processed_data.append(
-                        ProcessedDataEntry(
-                            dataset_id=str(entry.get("dataset_id", "")),
-                            data_repository=str(entry.get("data_repository", "")),
-                            url=entry.get("url"),
-                            file=entry.get("file"),
-                            evidence_text=entry.get("evidence_text"),
-                        )
+                if not isinstance(entry, dict):
+                    continue
+                norm = _normalize_entry_keys(entry)
+                if "dataset_id" not in norm:
+                    continue
+                result.processed_data.append(
+                    ProcessedDataEntry(
+                        dataset_id=str(norm.get("dataset_id") or ""),
+                        data_repository=str(norm.get("data_repository") or ""),
+                        url=norm.get("url"),
+                        file=norm.get("file"),
+                        evidence_text=norm.get("evidence_text"),
                     )
+                )
 
     # Parse analysis methods
     if "analysis_methods" in data:

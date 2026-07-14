@@ -2096,18 +2096,23 @@ async def validate_articles_from_db(
     db_path: str | Path,
     limit: int = 100,
     title_similarity_threshold: float = 0.85,
-    requests_per_second: float = 1.0,
+    requests_per_second: Optional[float] = None,
 ) -> BatchValidationResult:
     """Validate all articles in a database for metadata consistency.
 
     Fetches articles from the database and validates each one against
-    CrossRef (for DOI) and PubMed (for PMID/PMCID).
+    CrossRef (for DOI) and PubMed (for PMID/PMCID). PubMed requests use
+    exponential backoff with retry (honoring Retry-After) and an optional NCBI
+    API key (resolved from the ``NCBI_API_KEY`` environment variable or a
+    ``.claude/ncbi.key`` file) so transient HTTP 429 responses do not corrupt
+    the batch results.
 
     Args:
         db_path: Path to the SQLite database containing articles.
         limit: Maximum number of articles to validate.
         title_similarity_threshold: Minimum Jaccard similarity for title matching.
-        requests_per_second: Maximum API requests per second (default 3.0).
+        requests_per_second: Maximum API requests per second. If omitted,
+            defaults to 10 when an NCBI API key is configured and 3 otherwise.
 
     Returns:
         BatchValidationResult with validation results for each article.

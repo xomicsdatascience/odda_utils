@@ -1,14 +1,144 @@
 # Validate article metadata consistency across identifiers (DOI, PMID, PMCID).
+#
+# Fetches metadata from CrossRef (by DOI) and PubMed/NCBI (by PMID/PMCID) and
+# compares it against the values stored in the local database. To avoid the
+# historical failure mode where a reference-list DOI was mistaken for the
+# article's own DOI, PubMed extraction reads only the article-level identifiers
+# (ELocationID and the PubmedData/ArticleIdList), never descendant ArticleId
+# elements that also appear inside the cited-reference list. NCBI requests use
+# exponential backoff with retry (honoring Retry-After) and an optional NCBI
+# API key so transient HTTP 429 rate-limit responses do not corrupt validation.
 
 import asyncio
+import os
 import httpx
 import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from datetime import date
 import xml.etree.ElementTree as ET
+
+
+# NCBI E-utilities endpoints.
+NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+NCBI_ID_CONVERTER_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+
+# Identify this client to NCBI per their usage guidelines.
+NCBI_TOOL_NAME = "odda-article-validator"
+NCBI_TOOL_EMAIL = "odda@example.com"
+
+# Default location for an optional NCBI API key file, relative to the repo root.
+DEFAULT_NCBI_API_KEY_FILE = Path(".claude/ncbi.key")
+
+
+def resolve_ncbi_api_key(api_key: Optional[str] = None) -> Optional[str]:
+    """Resolve the NCBI E-utilities API key from the available sources.
+
+    Resolution order (first match wins):
+
+    1. An explicitly supplied ``api_key`` argument.
+    2. The ``NCBI_API_KEY`` environment variable.
+    3. A ``.claude/ncbi.key`` file in the current working directory.
+
+    An NCBI API key raises the E-utilities rate limit from 3 to 10 requests
+    per second, greatly reducing the chance of HTTP 429 responses during batch
+    validation. Its absence is not an error; requests simply proceed unkeyed.
+
+    Parameters
+    ----------
+    api_key : str, optional
+        Explicitly provided API key. Takes precedence over all other sources.
+
+    Returns
+    -------
+    str or None
+        The resolved API key, or ``None`` if no key is configured.
+    """
+    if api_key:
+        return api_key.strip()
+
+    env_key = os.environ.get("NCBI_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+
+    try:
+        if DEFAULT_NCBI_API_KEY_FILE.is_file():
+            file_key = DEFAULT_NCBI_API_KEY_FILE.read_text(encoding="utf-8").strip()
+            if file_key:
+                return file_key
+    except OSError:
+        # A missing or unreadable key file is not fatal; proceed unkeyed.
+        pass
+
+    return None
+
+
+async def _get_with_backoff(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict,
+    timeout: float,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+) -> httpx.Response:
+    """Perform a GET request with retry and exponential backoff on rate limits.
+
+    Retries on HTTP 429 (Too Many Requests) and transient 5xx responses,
+    honoring a ``Retry-After`` header when present. Other HTTP errors and
+    network errors are raised immediately (429/5xx are only raised after the
+    retry budget is exhausted).
+
+    Parameters
+    ----------
+    client : httpx.AsyncClient
+        The HTTP client used to issue the request.
+    url : str
+        The request URL.
+    params : dict
+        Query parameters for the request.
+    timeout : float
+        Per-request timeout in seconds.
+    max_retries : int
+        Maximum number of retry attempts after the initial request.
+    base_delay : float
+        Base delay in seconds for exponential backoff (delay = base * 2**attempt).
+
+    Returns
+    -------
+    httpx.Response
+        A successful (non-retryable) response.
+
+    Raises
+    ------
+    httpx.HTTPStatusError
+        If a non-retryable HTTP error occurs, or retries are exhausted.
+    httpx.RequestError
+        If a network error occurs.
+    """
+    retryable_statuses = {429, 500, 502, 503, 504}
+    attempt = 0
+    while True:
+        response = await client.get(url, params=params, timeout=timeout)
+        if response.status_code not in retryable_statuses:
+            response.raise_for_status()
+            return response
+
+        if attempt >= max_retries:
+            # Retry budget exhausted; surface the rate-limit/server error.
+            response.raise_for_status()
+            return response
+
+        # Prefer the server-provided Retry-After hint when available.
+        retry_after = response.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            delay = float(retry_after)
+        else:
+            delay = base_delay * (2 ** attempt)
+        await asyncio.sleep(delay)
+        attempt += 1
 
 
 class RateLimiter:
@@ -236,8 +366,7 @@ async def fetch_crossref_metadata(
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, timeout=timeout)
-            response.raise_for_status()
+            response = await _get_with_backoff(client, url, params={}, timeout=timeout)
             data = response.json()
         except httpx.HTTPStatusError as e:
             return ArticleMetadata(source="crossref", error=f"HTTP {e.response.status_code}")
@@ -279,13 +408,40 @@ async def fetch_crossref_metadata(
     )
 
 
+def _ncbi_common_params(api_key: Optional[str]) -> dict:
+    """Build the NCBI E-utilities parameters that identify this client.
+
+    Parameters
+    ----------
+    api_key : str, optional
+        A resolved NCBI API key to include, if available.
+
+    Returns
+    -------
+    dict
+        Parameters containing tool/email identification and, when configured,
+        the API key.
+    """
+    params = {"tool": NCBI_TOOL_NAME, "email": NCBI_TOOL_EMAIL}
+    if api_key:
+        params["api_key"] = api_key
+    return params
+
+
 async def fetch_pubmed_metadata(
     pmid: Optional[str] = None,
     pmcid: Optional[str] = None,
     timeout: float = 10.0,
-    rate_limiter: Optional[RateLimiter] = None
+    rate_limiter: Optional[RateLimiter] = None,
+    api_key: Optional[str] = None,
 ) -> ArticleMetadata:
     """Fetch article metadata from PubMed/NCBI API using PMID or PMCID.
+
+    The article's own DOI and PMCID are read exclusively from the article-level
+    identifiers (``ELocationID`` and ``PubmedData/ArticleIdList``). Descendant
+    searches are deliberately avoided because a PubMed record's cited-reference
+    list contains its own ``ArticleId`` DOIs, which previously leaked into the
+    extracted DOI and produced spurious DOI-mismatch failures.
 
     Parameters
     ----------
@@ -297,6 +453,9 @@ async def fetch_pubmed_metadata(
         Request timeout in seconds.
     rate_limiter : RateLimiter, optional
         Rate limiter to control request frequency.
+    api_key : str, optional
+        NCBI E-utilities API key. If ``None``, it is resolved from the
+        ``NCBI_API_KEY`` environment variable or ``.claude/ncbi.key``.
 
     Returns
     -------
@@ -306,13 +465,13 @@ async def fetch_pubmed_metadata(
     if not pmid and not pmcid:
         return ArticleMetadata(source="pubmed", error="No PMID or PMCID provided")
 
-    # Use efetch API to get article metadata
-    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    resolved_api_key = resolve_ncbi_api_key(api_key)
 
     params = {
         "db": "pubmed",
         "retmode": "xml",
     }
+    params.update(_ncbi_common_params(resolved_api_key))
 
     if pmid:
         params["id"] = pmid
@@ -320,15 +479,13 @@ async def fetch_pubmed_metadata(
         # First convert PMCID to PMID using ID converter
         if rate_limiter:
             await rate_limiter.acquire()
-        converter_url = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+        converter_params = {"ids": pmcid, "format": "json"}
+        converter_params.update(_ncbi_common_params(resolved_api_key))
         async with httpx.AsyncClient() as client:
             try:
-                resp = await client.get(
-                    converter_url,
-                    params={"ids": pmcid, "format": "json"},
-                    timeout=timeout
+                resp = await _get_with_backoff(
+                    client, NCBI_ID_CONVERTER_URL, params=converter_params, timeout=timeout
                 )
-                resp.raise_for_status()
                 conv_data = resp.json()
                 records = conv_data.get("records", [])
                 if records and "pmid" in records[0]:
@@ -343,8 +500,9 @@ async def fetch_pubmed_metadata(
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(base_url, params=params, timeout=timeout)
-            response.raise_for_status()
+            response = await _get_with_backoff(
+                client, NCBI_EFETCH_URL, params=params, timeout=timeout
+            )
             xml_content = response.text
         except httpx.HTTPStatusError as e:
             return ArticleMetadata(source="pubmed", error=f"HTTP {e.response.status_code}")
@@ -361,8 +519,8 @@ async def fetch_pubmed_metadata(
     if article is None:
         return ArticleMetadata(source="pubmed", error="No article found in response")
 
-    # Extract title
-    title_elem = article.find(".//ArticleTitle")
+    # Extract title (article-scoped path; avoid any descendant ArticleTitle).
+    title_elem = article.find("./MedlineCitation/Article/ArticleTitle")
     title = title_elem.text if title_elem is not None else None
 
     # Helper to parse PubMed date elements
@@ -385,30 +543,41 @@ async def fetch_pubmed_metadata(
         except (ValueError, AttributeError):
             return None
 
-    # Extract print publication date (PubDate in JournalIssue)
-    print_pub_date = _parse_pubmed_date_elem(article.find(".//JournalIssue/PubDate"))
-
-    # Extract electronic publication date (ArticleDate with DateType='Electronic')
-    electronic_pub_date = _parse_pubmed_date_elem(
-        article.find(".//ArticleDate[@DateType='Electronic']")
+    # Extract print publication date (article-scoped JournalIssue/PubDate).
+    print_pub_date = _parse_pubmed_date_elem(
+        article.find("./MedlineCitation/Article/Journal/JournalIssue/PubDate")
     )
 
-    # Extract IDs
-    extracted_pmid = None
-    extracted_pmcid = None
+    # Extract electronic publication date (article-scoped ArticleDate).
+    electronic_pub_date = _parse_pubmed_date_elem(
+        article.find("./MedlineCitation/Article/ArticleDate[@DateType='Electronic']")
+    )
+
+    # Extract IDs using article-scoped paths only. The cited-reference list
+    # (PubmedData/ReferenceList) contains its own ArticleId DOIs and PMIDs, so a
+    # descendant search (.//) would pick up an unrelated reference identifier.
+    extracted_pmid = article.findtext("./MedlineCitation/PMID")
+
     extracted_doi = None
+    extracted_pmcid = None
 
-    pmid_elem = article.find(".//PMID")
-    if pmid_elem is not None:
-        extracted_pmid = pmid_elem.text
+    # Preferred source: the article's own PubmedData/ArticleIdList (direct child
+    # ArticleId elements only, never the nested reference-list entries).
+    id_list = article.find("./PubmedData/ArticleIdList")
+    if id_list is not None:
+        for article_id in id_list.findall("./ArticleId"):
+            id_type = article_id.get("IdType")
+            if id_type == "doi" and not extracted_doi:
+                extracted_doi = article_id.text
+            elif id_type == "pmc" and not extracted_pmcid:
+                extracted_pmcid = article_id.text
 
-    # Look for DOI and PMCID in ArticleIdList
-    for article_id in article.findall(".//ArticleId"):
-        id_type = article_id.get("IdType")
-        if id_type == "doi":
-            extracted_doi = article_id.text
-        elif id_type == "pmc":
-            extracted_pmcid = article_id.text
+    # Fall back to the article's ELocationID DOI if the ArticleIdList lacked one.
+    if not extracted_doi:
+        for eloc in article.findall("./MedlineCitation/Article/ELocationID"):
+            if eloc.get("EIdType") == "doi" and eloc.text:
+                extracted_doi = eloc.text
+                break
 
     return ArticleMetadata(
         title=title,
@@ -429,7 +598,8 @@ async def validate_article(
     stored_publication_date: Optional[date] = None,
     stored_electronic_publication_date: Optional[date] = None,
     title_similarity_threshold: float = 0.85,
-    rate_limiter: Optional[RateLimiter] = None
+    rate_limiter: Optional[RateLimiter] = None,
+    api_key: Optional[str] = None,
 ) -> ValidationResult:
     """Validate article metadata consistency across identifiers.
 
@@ -459,6 +629,9 @@ async def validate_article(
         Minimum Jaccard similarity for titles to match.
     rate_limiter : RateLimiter, optional
         Rate limiter to control API request frequency.
+    api_key : str, optional
+        NCBI E-utilities API key. If ``None``, it is resolved from the
+        ``NCBI_API_KEY`` environment variable or ``.claude/ncbi.key``.
 
     Returns
     -------
@@ -519,7 +692,9 @@ async def validate_article(
 
     # Fetch metadata from PubMed if PMID or PMCID provided
     if pmid or pmcid:
-        result.pubmed_metadata = await fetch_pubmed_metadata(pmid=pmid, pmcid=pmcid, rate_limiter=rate_limiter)
+        result.pubmed_metadata = await fetch_pubmed_metadata(
+            pmid=pmid, pmcid=pmcid, rate_limiter=rate_limiter, api_key=api_key
+        )
 
         if result.pubmed_metadata.error:
             result.issues.append(f"PubMed lookup failed: {result.pubmed_metadata.error}")
@@ -592,9 +767,16 @@ async def validate_article(
 async def validate_article_batch(
     articles: list[dict],
     title_similarity_threshold: float = 0.85,
-    requests_per_second: float = 1.0
+    requests_per_second: Optional[float] = None,
+    api_key: Optional[str] = None,
 ) -> list[ValidationResult]:
     """Validate a batch of articles with rate limiting.
+
+    A single :class:`RateLimiter` is shared across all articles so the batch
+    stays within NCBI's request limits. When an NCBI API key is configured the
+    default rate is raised from 3 to 10 requests per second (NCBI's keyed
+    limit); combined with per-request backoff/retry this keeps transient HTTP
+    429 responses from corrupting validation results.
 
     Parameters
     ----------
@@ -603,14 +785,24 @@ async def validate_article_batch(
         electronic_publication_date.
     title_similarity_threshold : float
         Minimum similarity for titles to match.
-    requests_per_second : float
-        Maximum API requests per second (default 1.0).
+    requests_per_second : float, optional
+        Maximum API requests per second. If ``None``, defaults to 10.0 when an
+        NCBI API key is configured and 3.0 otherwise.
+    api_key : str, optional
+        NCBI E-utilities API key. If ``None``, it is resolved from the
+        ``NCBI_API_KEY`` environment variable or ``.claude/ncbi.key``.
 
     Returns
     -------
     list[ValidationResult]
         Validation results for each article.
     """
+    resolved_api_key = resolve_ncbi_api_key(api_key)
+
+    if requests_per_second is None:
+        # Stay safely under NCBI's limits (10 rps keyed, 3 rps unkeyed).
+        requests_per_second = 10.0 if resolved_api_key else 3.0
+
     rate_limiter = RateLimiter(requests_per_second=requests_per_second)
 
     tasks = [
@@ -622,7 +814,8 @@ async def validate_article_batch(
             stored_publication_date=a.get("publication_date"),
             stored_electronic_publication_date=a.get("electronic_publication_date"),
             title_similarity_threshold=title_similarity_threshold,
-            rate_limiter=rate_limiter
+            rate_limiter=rate_limiter,
+            api_key=resolved_api_key,
         )
         for a in articles
     ]
