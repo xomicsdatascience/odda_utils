@@ -156,6 +156,16 @@ from odda_utils.sandbox import (
     run_analysis_sandboxed as _run_analysis_sandboxed,
     list_analysis_versions as _list_analysis_versions,
 )
+from odda_utils.table_summary import (
+    summarize_table as _summarize_table,
+    TableSummary,
+    ColumnSummary,
+    DEFAULT_MAX_COLUMNS_DETAILED as _TABLE_MAX_COLUMNS,
+    DEFAULT_MAX_EXAMPLE_ROWS as _TABLE_MAX_ROWS,
+    DEFAULT_MAX_CELL_CHARS as _TABLE_MAX_CELL,
+    DEFAULT_MAX_TOP_VALUES as _TABLE_MAX_TOP,
+    DEFAULT_MAX_SCAN_ROWS as _TABLE_MAX_SCAN,
+)
 
 logger = logging.getLogger(__name__)
 app = FastMCP("odda")
@@ -3714,6 +3724,66 @@ def score_study_relevance(
         )
     finally:
         conn.close()
+
+
+@app.tool()
+def summarize_table(
+    path: str | Path,
+    sheet: str | None = None,
+    delimiter: str | None = None,
+    max_columns_detailed: int = _TABLE_MAX_COLUMNS,
+    max_example_rows: int = _TABLE_MAX_ROWS,
+    max_cell_chars: int = _TABLE_MAX_CELL,
+    max_top_values: int = _TABLE_MAX_TOP,
+    max_scan_rows: int = _TABLE_MAX_SCAN,
+) -> TableSummary:
+    """Summarize a table/matrix into a bounded, LLM-safe description.
+
+    Cost- and context-safety control: a whole omics quantification matrix
+    (thousands of features x many samples) must NEVER be placed into a model's
+    context. Use this tool to understand a table's STRUCTURE and content
+    instead of ever reading a raw matrix into context. Python (pandas/numpy)
+    does all the table work here; the returned summary is hard-capped along the
+    row, column, and cell dimensions so it can never reproduce the full matrix,
+    regardless of input size.
+
+    The summary reports the file type, shape (rows x columns), and for each
+    described column its dtype, null/uniqueness counts, and EITHER numeric
+    statistics (min/max/mean/median/std) OR the top categorical values, plus a
+    few example rows with every cell truncated. Reads CSV/TSV/other delimited
+    text, Excel, Parquet, and Feather.
+
+    Actual quantitative computation on matrices (QC, differential expression,
+    cross-study meta-analysis) is done elsewhere in Python -- the sandboxed
+    ``run_analysis`` container and the ``meta_analysis`` tool -- which return
+    only compact results. Only these summaries/results, never raw matrices,
+    should reach an LLM.
+
+    Args:
+        path: Path to the table file.
+        sheet: Excel sheet name (defaults to the first sheet).
+        delimiter: Field delimiter for delimited text; auto-sniffed if omitted.
+        max_columns_detailed: Cap on the number of columns detailed.
+        max_example_rows: Cap on the number of example rows returned.
+        max_cell_chars: Cap on the length of any single cell/value string.
+        max_top_values: Cap on top values reported per categorical column.
+        max_scan_rows: Cap on rows pandas scans (bounds host memory/time).
+
+    Returns:
+        TableSummary with the file type, shape, per-column ColumnSummary
+        entries, a few truncated example rows, and notes. On a read/parse
+        failure the ``error`` field is set instead of raising.
+    """
+    return _summarize_table(
+        path,
+        sheet=sheet,
+        delimiter=delimiter,
+        max_columns_detailed=max_columns_detailed,
+        max_example_rows=max_example_rows,
+        max_cell_chars=max_cell_chars,
+        max_top_values=max_top_values,
+        max_scan_rows=max_scan_rows,
+    )
 
 
 def main():
