@@ -613,3 +613,77 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_pmid ON benchmark_predictio
 CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_pmcid ON benchmark_predictions(pmcid);
 CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_dataset ON benchmark_predictions(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_benchmark_predictions_model ON benchmark_predictions(model);
+
+-- ===========================================================================
+-- Question-conditioned relevance gate (feature request #53)
+-- Two additive tables that let cross-study aggregation pool only studies that
+-- directly measure the analyte of interest in the correct biological
+-- system/compartment under the correct contrast. Both are new tables, so
+-- CREATE TABLE IF NOT EXISTS takes effect on the live articles.sqlite.
+-- ===========================================================================
+
+-- Ingestion-time measurement descriptor.
+-- Captured as extra fields on the EXISTING LLM extraction pass (near-zero
+-- marginal cost -- same LLM call). Describes WHAT/WHERE/HOW a study measures so
+-- a question-time relevance score can be computed cheaply against this cached
+-- descriptor and reused across many questions. One row per article per model.
+CREATE TABLE IF NOT EXISTS llm_measurement_descriptors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi VARCHAR(40) REFERENCES articles(doi),
+    pmid VARCHAR(30) REFERENCES articles(pmid),
+    pmcid VARCHAR(30) REFERENCES articles(pmcid),
+    biological_system TEXT,          -- biological system / cell type
+    measured_compartment VARCHAR(50),-- whole-cell | EV/exosome | secretome | tissue | nuclei | cell-type-specific in vivo | other/unknown
+    species TEXT,
+    perturbations TEXT,              -- perturbations / contrasts studied
+    omics_assay TEXT,                -- omics / assay modality
+    evidence_text TEXT,
+    model VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(doi, model),
+    UNIQUE(pmid, model),
+    UNIQUE(pmcid, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_doi ON llm_measurement_descriptors(doi);
+CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_pmid ON llm_measurement_descriptors(pmid);
+CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_pmcid ON llm_measurement_descriptors(pmcid);
+CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_compartment ON llm_measurement_descriptors(measured_compartment);
+CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_model ON llm_measurement_descriptors(model);
+
+-- Question-conditioned study relevance scores.
+-- One row per (study, question) judgement, persisted for provenance so no study
+-- is ever silently dropped from a cross-study comparison. Records the minimal
+-- LLM judgement (score, directly_measures, reason), the derived gating verdict,
+-- how much context was sent (descriptor/excerpt/full_text), whether the input
+-- was escalated to full text, the injection-telemetry signal for the scored
+-- text, and the model/provider provenance.
+CREATE TABLE IF NOT EXISTS study_relevance_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi VARCHAR(40),
+    pmid VARCHAR(30),
+    pmcid VARCHAR(30),
+    study_label TEXT,                 -- label for supplied-text studies with no stored id
+    question TEXT NOT NULL,
+    question_sha256 VARCHAR(64),
+    score REAL,
+    directly_measures BOOLEAN,
+    reason TEXT,
+    verdict VARCHAR(10),              -- include | exclude | flag | error
+    escalated BOOLEAN DEFAULT FALSE,
+    context_level VARCHAR(20),        -- descriptor | excerpt | full_text
+    injection_risk_score REAL,
+    injection_risk_level VARCHAR(10),
+    injection_flagged BOOLEAN DEFAULT FALSE,
+    model VARCHAR(100),
+    provider VARCHAR(100),
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_study_rel_doi ON study_relevance_scores(doi);
+CREATE INDEX IF NOT EXISTS idx_study_rel_pmid ON study_relevance_scores(pmid);
+CREATE INDEX IF NOT EXISTS idx_study_rel_pmcid ON study_relevance_scores(pmcid);
+CREATE INDEX IF NOT EXISTS idx_study_rel_question ON study_relevance_scores(question_sha256);
+CREATE INDEX IF NOT EXISTS idx_study_rel_verdict ON study_relevance_scores(verdict);
+CREATE INDEX IF NOT EXISTS idx_study_rel_created ON study_relevance_scores(created_at);

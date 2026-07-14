@@ -63,6 +63,7 @@ from odda_utils.metadata.llm_metadata import (
     store_extracted_processed_data,
     store_extracted_analysis_methods,
     store_extracted_code,
+    store_extracted_measurement_descriptor,
     store_llm_extraction_record,
     LLMExtractionError,
 )
@@ -141,6 +142,15 @@ from odda_utils.injection_scan import (
     InjectionScanBatchResult,
     CategorySignal,
     InjectionMatch,
+)
+from odda_utils.relevance import (
+    score_study_relevance as _score_study_relevance,
+    StudyRelevanceResult,
+    INCLUDE_THRESHOLD as _RELEVANCE_INCLUDE_THRESHOLD,
+    EXCLUDE_THRESHOLD as _RELEVANCE_EXCLUDE_THRESHOLD,
+    DEFAULT_MAX_OUTPUT_TOKENS as _RELEVANCE_MAX_OUTPUT_TOKENS,
+    DEFAULT_EXCERPT_CHARS as _RELEVANCE_EXCERPT_CHARS,
+    DEFAULT_FULLTEXT_CHARS as _RELEVANCE_FULLTEXT_CHARS,
 )
 from odda_utils.sandbox import (
     run_analysis_sandboxed as _run_analysis_sandboxed,
@@ -878,6 +888,17 @@ def _extract_article_llm_metadata_impl(
                     len(extracted.code),
                     article_id,
                 )
+
+            if extracted.measurement_descriptor is not None:
+                store_extracted_measurement_descriptor(
+                    conn,
+                    extracted.measurement_descriptor,
+                    llm_model,
+                    doi=article_doi,
+                    pmid=article_pmid,
+                    pmcid=article_pmcid,
+                )
+                logger.debug("Stored measurement descriptor for %s", article_id)
 
             result.newly_extracted += 1
             logger.info("Extracted LLM metadata for %s", article_id)
@@ -3599,6 +3620,100 @@ async def run_analysis(
             result["provenance_error"] = f"failed to record analysis run: {e}"
 
     return result
+
+
+@app.tool()
+def score_study_relevance(
+    db_path: str | Path,
+    question: str,
+    study_id: str | None = None,
+    study_text: str | None = None,
+    study_label: str | None = None,
+    use_descriptor: bool = True,
+    escalate: bool = True,
+    llm_model: str | None = None,
+    config_file: str | None = None,
+    descriptor_model: str | None = None,
+    max_output_tokens: int = _RELEVANCE_MAX_OUTPUT_TOKENS,
+    excerpt_chars: int = _RELEVANCE_EXCERPT_CHARS,
+    fulltext_chars: int = _RELEVANCE_FULLTEXT_CHARS,
+    include_threshold: float = _RELEVANCE_INCLUDE_THRESHOLD,
+    exclude_threshold: float = _RELEVANCE_EXCLUDE_THRESHOLD,
+    persist: bool = True,
+) -> StudyRelevanceResult:
+    """Score one study's relevance to a research question and gate it.
+
+    A question-conditioned RELEVANCE GATE for cross-study aggregation. Given a
+    research question and a study (by stored id or supplied text), this sends
+    only a bounded excerpt (title + abstract + methods, or a cached measurement
+    descriptor) plus the question to the configured chat model and returns a
+    MINIMAL structured judgement -- ``{score, directly_measures, reason}`` --
+    with OUTPUT tokens capped low because output tokens dominate cost. It
+    prevents wrong-compartment / wrong-cell studies (e.g. exosome/secretome,
+    whole-tissue, or other-cell proteomes) from contaminating a meta-analysis.
+
+    Because relevance is judged from UNTRUSTED article text, the injection-
+    telemetry scan is run on the text FIRST and its signal is returned/stored.
+    Every judgement (including errors) is persisted to ``study_relevance_scores``
+    so no study is ever silently dropped. Borderline (flagged) first passes are
+    re-scored against full text when ``escalate`` is True.
+
+    Recommended gating policy (applied and returned as ``verdict``):
+    auto-INCLUDE ``score >= include_threshold`` with ``directly_measures`` true;
+    auto-EXCLUDE ``score < exclude_threshold``; FLAG the middle band -- and any
+    high score with ``directly_measures`` false -- for human review.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        question: The research question to condition relevance on.
+        study_id: Stored article identifier (DOI, PMID, or PMCID). Provide this
+            OR study_text.
+        study_text: Raw supplied study text (used when study_id is not given).
+        study_label: Label for a supplied-text study (provenance).
+        use_descriptor: Prefer a cached measurement descriptor (cheapest
+            context) when available.
+        escalate: Re-score borderline (flagged) first passes against full text.
+        llm_model: Chat model override (honoured only for azure_openai;
+            otherwise the provider's configured model is used).
+        config_file: Override for the model-config path.
+        descriptor_model: Restrict cached-descriptor lookup to this extraction
+            model.
+        max_output_tokens: Cap on OUTPUT tokens for the minimal JSON.
+        excerpt_chars: Character cap for the first-pass excerpt.
+        fulltext_chars: Character cap for the escalated full-text pass.
+        include_threshold: Auto-include score threshold (with directly_measures).
+        exclude_threshold: Auto-exclude score threshold.
+        persist: Persist the judgement to study_relevance_scores.
+
+    Returns:
+        StudyRelevanceResult with the verdict (include/exclude/flag/error),
+        score, directly_measures, reason, the context level used, whether the
+        input was escalated to full text, the injection telemetry, model/
+        provider provenance, the gating thresholds, the persisted record id, and
+        any error message.
+    """
+    conn = init_db(db_path)
+    try:
+        return _score_study_relevance(
+            conn,
+            question=question,
+            study_id=study_id,
+            study_text=study_text,
+            study_label=study_label,
+            use_descriptor=use_descriptor,
+            escalate=escalate,
+            llm_model=llm_model,
+            config_file=config_file,
+            descriptor_model=descriptor_model,
+            max_output_tokens=max_output_tokens,
+            excerpt_chars=excerpt_chars,
+            fulltext_chars=fulltext_chars,
+            include_threshold=include_threshold,
+            exclude_threshold=exclude_threshold,
+            persist=persist,
+        )
+    finally:
+        conn.close()
 
 
 def main():

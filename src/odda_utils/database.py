@@ -13,6 +13,13 @@ benchmark_annotations, and benchmark_predictions. These record full provenance
 model/provider) so every quantification/analysis result is reproducible. List
 and dict values are stored in JSON TEXT columns via the ``_encode_json`` /
 ``_decode_json`` helpers.
+
+It additionally provides the question-conditioned relevance gate (feature
+request #53): cached per-article measurement descriptors
+(``llm_measurement_descriptors``) captured on the existing LLM extraction pass,
+and per-(study, question) relevance judgements (``study_relevance_scores``)
+persisted for provenance so no study is silently dropped from a cross-study
+comparison.
 """
 
 import json
@@ -961,6 +968,306 @@ def insert_llm_extraction(
     )
     conn.commit()
     return cursor.lastrowid
+
+
+def insert_measurement_descriptor(
+    conn: sqlite3.Connection,
+    model: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    biological_system: str | None = None,
+    measured_compartment: str | None = None,
+    species: str | None = None,
+    perturbations: str | None = None,
+    omics_assay: str | None = None,
+    evidence_text: str | None = None,
+) -> int:
+    """Insert or replace an article's measurement descriptor for a model.
+
+    The measurement descriptor is captured on the existing LLM extraction pass
+    and cached so a question-time relevance score can be computed cheaply
+    against it and reused across questions. Upserts on the (id, model) pair so
+    re-extraction refreshes the descriptor in place.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    model : str
+        Name of the LLM model used for extraction.
+    doi, pmid, pmcid : str, optional
+        Article identifiers (at least one should be provided).
+    biological_system : str, optional
+        Biological system / cell type measured.
+    measured_compartment : str, optional
+        Measured compartment (whole-cell | EV/exosome | secretome | tissue |
+        nuclei | cell-type-specific in vivo | other/unknown).
+    species : str, optional
+        Species studied.
+    perturbations : str, optional
+        Perturbations / contrasts studied.
+    omics_assay : str, optional
+        Omics / assay modality.
+    evidence_text : str, optional
+        Supporting text from the article.
+
+    Returns
+    -------
+    int
+        The id of the inserted or updated descriptor row.
+    """
+    # Upsert keyed on whichever identifier is present. INSERT OR REPLACE would
+    # break the AUTOINCREMENT id, so delete any prior row for this id+model
+    # first, then insert.
+    if doi:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE doi = ? AND model = ?",
+            (doi, model),
+        )
+    elif pmid:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE pmid = ? AND model = ?",
+            (pmid, model),
+        )
+    elif pmcid:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE pmcid = ? AND model = ?",
+            (pmcid, model),
+        )
+
+    cursor = conn.execute(
+        """
+        INSERT INTO llm_measurement_descriptors (
+            doi, pmid, pmcid, biological_system, measured_compartment, species,
+            perturbations, omics_assay, evidence_text, model
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doi,
+            pmid,
+            pmcid,
+            biological_system,
+            measured_compartment,
+            species,
+            perturbations,
+            omics_assay,
+            evidence_text,
+            model,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_measurement_descriptor(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    model: str | None = None,
+) -> sqlite3.Row | None:
+    """Retrieve a cached measurement descriptor for an article.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi, pmid, pmcid : str, optional
+        Article identifiers (at least one must be provided).
+    model : str, optional
+        If given, restrict to descriptors produced by this model.
+
+    Returns
+    -------
+    sqlite3.Row or None
+        The most recent matching descriptor row, or None if none exists.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if not conditions:
+        return None
+    where = "(" + " OR ".join(conditions) + ")"
+    if model:
+        where += " AND model = ?"
+        params.append(model)
+    cursor = conn.execute(
+        f"SELECT * FROM llm_measurement_descriptors WHERE {where} "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        params,
+    )
+    return cursor.fetchone()
+
+
+def insert_study_relevance_score(
+    conn: sqlite3.Connection,
+    question: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    study_label: str | None = None,
+    question_sha256: str | None = None,
+    score: float | None = None,
+    directly_measures: bool | None = None,
+    reason: str | None = None,
+    verdict: str | None = None,
+    escalated: bool | None = None,
+    context_level: str | None = None,
+    injection_risk_score: float | None = None,
+    injection_risk_level: str | None = None,
+    injection_flagged: bool | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    error: str | None = None,
+) -> int:
+    """Persist a question-conditioned study relevance judgement for provenance.
+
+    Every judgement is recorded (including errors) so no study is ever silently
+    dropped from a cross-study comparison.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    question : str
+        The research question the study was scored against.
+    doi, pmid, pmcid : str, optional
+        Stored article identifiers, when the study is in the database.
+    study_label : str, optional
+        Label for a supplied-text study that has no stored identifier.
+    question_sha256 : str, optional
+        Hex SHA-256 of the question, for grouping scores by question.
+    score : float, optional
+        Relevance score in [0, 1].
+    directly_measures : bool, optional
+        Whether the study directly measures the requested analyte/compartment.
+    reason : str, optional
+        Short (<=8 word) justification from the model.
+    verdict : str, optional
+        Gating verdict: include | exclude | flag | error.
+    escalated : bool, optional
+        Whether scoring escalated to full text for a borderline case.
+    context_level : str, optional
+        How much context was sent: descriptor | excerpt | full_text.
+    injection_risk_score : float, optional
+        Bounded prompt-injection risk score of the scored text.
+    injection_risk_level : str, optional
+        Coarse injection risk level (none/low/medium/high).
+    injection_flagged : bool, optional
+        Whether the injection scan flagged the scored text.
+    model : str, optional
+        Chat model that produced the judgement.
+    provider : str, optional
+        Provider of the chat model.
+    error : str, optional
+        Error message if the judgement could not be produced.
+
+    Returns
+    -------
+    int
+        The id of the inserted relevance-score row.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO study_relevance_scores (
+            doi, pmid, pmcid, study_label, question, question_sha256, score,
+            directly_measures, reason, verdict, escalated, context_level,
+            injection_risk_score, injection_risk_level, injection_flagged,
+            model, provider, error
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doi,
+            pmid,
+            pmcid,
+            study_label,
+            question,
+            question_sha256,
+            score,
+            None if directly_measures is None else int(bool(directly_measures)),
+            reason,
+            verdict,
+            None if escalated is None else int(bool(escalated)),
+            context_level,
+            injection_risk_score,
+            injection_risk_level,
+            None if injection_flagged is None else int(bool(injection_flagged)),
+            model,
+            provider,
+            error,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_study_relevance_scores(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    question_sha256: str | None = None,
+    verdict: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve persisted study relevance scores, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi, pmid, pmcid : str, optional
+        Filter by stored article identifier.
+    question_sha256 : str, optional
+        Filter by question hash (all studies scored against one question).
+    verdict : str, optional
+        Filter by gating verdict (include/exclude/flag/error).
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching score rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if question_sha256:
+        conditions.append("question_sha256 = ?")
+        params.append(question_sha256)
+    if verdict:
+        conditions.append("verdict = ?")
+        params.append(verdict)
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = (
+        f"SELECT * FROM study_relevance_scores WHERE {where_clause} "
+        "ORDER BY created_at DESC, id DESC"
+    )
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
 
 
 def get_llm_extraction(

@@ -56,6 +56,23 @@ For the key, "code", identify the parts of the text related to the code used to 
 -- Description of the code's purpose.
 """
 
+measurement_descriptor_prompt = """
+=== MEASUREMENT DESCRIPTOR ===
+For the key, "measurement_descriptor", summarize WHAT this study actually measures so a later step can judge, cheaply, whether the study is relevant to a specific research question. Return a single dictionary (not a list) with the following keys. Base every field ONLY on the text; if a field cannot be determined, use null.
+- biological_system
+-- The biological system or cell type that is measured (e.g. "primary microglia", "HeLa cells", "mouse hippocampus"). Be specific about the exact cell type or tissue.
+- measured_compartment
+-- The compartment that was actually measured. Choose the single best-fitting value from: "whole-cell", "EV/exosome", "secretome", "tissue", "nuclei", "cell-type-specific in vivo", or "other/unknown".
+- species
+-- The species studied (e.g. "human", "mouse", "rat").
+- perturbations
+-- The perturbations or contrasts studied (e.g. "LPS vs vehicle", "Alzheimer's disease vs control", "gene knockout vs wild-type"). Summarize as a short phrase.
+- omics_assay
+-- The omics modality / assay used to measure (e.g. "bulk proteomics (DIA-LC-MS/MS)", "bulk RNA-seq", "scRNA-seq", "phosphoproteomics").
+- evidence_text
+-- A short quote from the article supporting the above.
+"""
+
 postamble = """
 BEGIN TEXT TO PROCESS
 =====================

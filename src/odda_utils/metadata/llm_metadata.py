@@ -15,6 +15,7 @@ from odda_utils.database import (
     get_article_by_pmid,
     init_db,
     insert_llm_extraction,
+    insert_measurement_descriptor,
     insert_or_get_llm_keyword,
     link_article_llm_keyword,
 )
@@ -22,6 +23,7 @@ from odda_utils.prompts import (
     analysis_methods,
     code_prompt,
     keyword_data_prompt,
+    measurement_descriptor_prompt,
     postamble,
     preamble,
     processed_data_prompt,
@@ -89,6 +91,35 @@ class CodeEntry:
 
 
 @dataclass
+class MeasurementDescriptor:
+    """Ingestion-time descriptor of what a study measures.
+
+    Captured on the existing LLM extraction pass (near-zero marginal cost) and
+    cached so a question-conditioned relevance score can be computed cheaply
+    against it and reused across questions.
+    """
+
+    biological_system: str | None = None
+    measured_compartment: str | None = None
+    species: str | None = None
+    perturbations: str | None = None
+    omics_assay: str | None = None
+    evidence_text: str | None = None
+
+    def is_empty(self) -> bool:
+        """Return True when no descriptor field was populated."""
+        return not any(
+            (
+                self.biological_system,
+                self.measured_compartment,
+                self.species,
+                self.perturbations,
+                self.omics_assay,
+            )
+        )
+
+
+@dataclass
 class ExtractedMetadata:
     """Container for all extracted metadata."""
 
@@ -97,6 +128,7 @@ class ExtractedMetadata:
     processed_data: list[ProcessedDataEntry] = field(default_factory=list)
     analysis_methods: list[AnalysisMethod] = field(default_factory=list)
     code: list[CodeEntry] = field(default_factory=list)
+    measurement_descriptor: MeasurementDescriptor | None = None
     raw_response: str | None = None
     model: str | None = None
 
@@ -108,6 +140,7 @@ def build_extraction_prompt(
     include_processed_data: bool = True,
     include_analysis_methods: bool = True,
     include_code: bool = True,
+    include_measurement_descriptor: bool = True,
 ) -> str:
     """Build the full extraction prompt from subsections.
 
@@ -118,6 +151,10 @@ def build_extraction_prompt(
         include_processed_data: Whether to include processed data extraction.
         include_analysis_methods: Whether to include analysis methods extraction.
         include_code: Whether to include code extraction.
+        include_measurement_descriptor: Whether to include the measurement
+            descriptor (biological system/cell type, measured compartment,
+            species, perturbations/contrasts, omics/assay) used by the
+            question-conditioned relevance gate.
 
     Returns:
         The complete prompt string.
@@ -134,6 +171,8 @@ def build_extraction_prompt(
         parts.append(analysis_methods.strip())
     if include_code:
         parts.append(code_prompt.strip())
+    if include_measurement_descriptor:
+        parts.append(measurement_descriptor_prompt.strip())
 
     parts.append(postamble.strip())
     parts.append(text)
@@ -411,6 +450,41 @@ def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
                         )
                     )
 
+    # Parse measurement descriptor (single dict). Tolerate a list by taking the
+    # first dict element, and normalize each field to a stripped string or None.
+    if "measurement_descriptor" in data:
+        descriptor = data["measurement_descriptor"]
+        if isinstance(descriptor, list):
+            descriptor = next(
+                (d for d in descriptor if isinstance(d, dict)), None
+            )
+        if isinstance(descriptor, dict):
+            norm = _normalize_entry_keys(descriptor)
+
+            def _field(*names: str) -> str | None:
+                for name in names:
+                    value = norm.get(name)
+                    if value not in (None, ""):
+                        return str(value).strip()
+                return None
+
+            parsed_descriptor = MeasurementDescriptor(
+                biological_system=_field(
+                    "biological_system", "biological_system_cell_type", "cell_type"
+                ),
+                measured_compartment=_field(
+                    "measured_compartment", "compartment"
+                ),
+                species=_field("species"),
+                perturbations=_field(
+                    "perturbations", "perturbations_contrasts", "contrasts"
+                ),
+                omics_assay=_field("omics_assay", "omics", "assay"),
+                evidence_text=_field("evidence_text"),
+            )
+            if not parsed_descriptor.is_empty():
+                result.measurement_descriptor = parsed_descriptor
+
     return result
 
 
@@ -684,6 +758,42 @@ def store_extracted_code(
     return count
 
 
+def store_extracted_measurement_descriptor(
+    conn: sqlite3.Connection,
+    descriptor: MeasurementDescriptor,
+    model: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+) -> int:
+    """Store an extracted measurement descriptor in the database.
+
+    Args:
+        conn: Database connection.
+        descriptor: The MeasurementDescriptor to store.
+        model: Name of the LLM model used for extraction.
+        doi: Article DOI.
+        pmid: Article PMID.
+        pmcid: Article PMCID.
+
+    Returns:
+        The id of the stored descriptor row.
+    """
+    return insert_measurement_descriptor(
+        conn,
+        model=model,
+        doi=doi,
+        pmid=pmid,
+        pmcid=pmcid,
+        biological_system=descriptor.biological_system,
+        measured_compartment=descriptor.measured_compartment,
+        species=descriptor.species,
+        perturbations=descriptor.perturbations,
+        omics_assay=descriptor.omics_assay,
+        evidence_text=descriptor.evidence_text,
+    )
+
+
 def store_llm_extraction_record(
     conn: sqlite3.Connection,
     prompt: str,
@@ -727,6 +837,7 @@ class ExtractionResult:
     processed_data_stored: int = 0
     analysis_methods_stored: int = 0
     code_stored: int = 0
+    measurement_descriptor_stored: bool = False
     extraction_id: int | None = None
     extracted_metadata: ExtractedMetadata | None = None
     error: str | None = None
@@ -888,6 +999,18 @@ def extract_and_store_metadata(
                 pmcid=article_pmcid,
             )
             logger.info("Stored %d code entries", result.code_stored)
+
+        if extracted.measurement_descriptor is not None:
+            store_extracted_measurement_descriptor(
+                conn,
+                extracted.measurement_descriptor,
+                model,
+                doi=article_doi,
+                pmid=article_pmid,
+                pmcid=article_pmcid,
+            )
+            result.measurement_descriptor_stored = True
+            logger.info("Stored measurement descriptor")
 
     finally:
         conn.close()
