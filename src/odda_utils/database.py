@@ -1123,9 +1123,6 @@ def insert_study_relevance_score(
     verdict: str | None = None,
     escalated: bool | None = None,
     context_level: str | None = None,
-    injection_risk_score: float | None = None,
-    injection_risk_level: str | None = None,
-    injection_flagged: bool | None = None,
     model: str | None = None,
     provider: str | None = None,
     error: str | None = None,
@@ -1159,12 +1156,6 @@ def insert_study_relevance_score(
         Whether scoring escalated to full text for a borderline case.
     context_level : str, optional
         How much context was sent: descriptor | excerpt | full_text.
-    injection_risk_score : float, optional
-        Bounded prompt-injection risk score of the scored text.
-    injection_risk_level : str, optional
-        Coarse injection risk level (none/low/medium/high).
-    injection_flagged : bool, optional
-        Whether the injection scan flagged the scored text.
     model : str, optional
         Chat model that produced the judgement.
     provider : str, optional
@@ -1182,10 +1173,9 @@ def insert_study_relevance_score(
         INSERT INTO study_relevance_scores (
             doi, pmid, pmcid, study_label, question, question_sha256, score,
             directly_measures, reason, verdict, escalated, context_level,
-            injection_risk_score, injection_risk_level, injection_flagged,
             model, provider, error
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             doi,
@@ -1200,9 +1190,6 @@ def insert_study_relevance_score(
             verdict,
             None if escalated is None else int(bool(escalated)),
             context_level,
-            injection_risk_score,
-            injection_risk_level,
-            None if injection_flagged is None else int(bool(injection_flagged)),
             model,
             provider,
             error,

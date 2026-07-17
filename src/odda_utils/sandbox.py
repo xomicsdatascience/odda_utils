@@ -11,10 +11,10 @@
 #     PID/IPC namespaces, and crucially NO $HOME mount (keeps credentials in
 #     ~/.claude out of the container).
 #   * --net --network none     : network egress disabled by default, which
-#     neutralizes the exfiltration and download-and-run categories the
-#     injection telemetry flags. If the platform cannot create an isolated
-#     network namespace unprivileged, the run FAILS CLOSED rather than running
-#     with host networking (override only with allow_network=True).
+#     neutralizes the exfiltration and download-and-run threat categories. If
+#     the platform cannot create an isolated network namespace unprivileged, the
+#     run FAILS CLOSED rather than running with host networking (override only
+#     with allow_network=True).
 #   * read-only root filesystem: the SIF image is immutable; the only writable
 #     path is a single scratch bind (the run's working directory at /work).
 #   * least-privilege data     : only the datasets explicitly named are bind
@@ -419,14 +419,13 @@ async def run_analysis_sandboxed(
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     allow_network: bool = False,
     version: Optional[str] = None,
-    scan_code: bool = True,
 ) -> Dict[str, Any]:
     """Execute agent-synthesized analysis code inside the hardened sandbox.
 
     Two-phase, review-gated:
 
     * **Preview** (``approved_code_sha256`` is None): validate inputs, hash the
-      code, scan it with the injection telemetry, and return the hash plus the
+      code, and return the hash plus the
       exact command that *would* run -- WITHOUT executing. The caller (a human,
       or an agent surfacing to a human) reviews the code and re-invokes with
       ``approved_code_sha256`` set to the returned hash.
@@ -455,15 +454,13 @@ async def run_analysis_sandboxed(
         If True, do NOT isolate the network (escape hatch; default False).
     version : str, optional
         Analysis image version; newest available if omitted.
-    scan_code : bool
-        If True, run ``scan_injection`` over the code and include the signal.
 
     Returns
     -------
     dict
         Structured result. Always includes ``ok`` and ``mode``
         ("preview" | "executed" | "rejected"). Preview adds ``code_sha256``,
-        ``code_files``, ``injection_scan``, and ``planned_command``. Execution
+        ``code_files``, and ``planned_command``. Execution
         adds ``exit_code``, ``stdout``, ``stderr``, ``timed_out``, truncation
         flags, ``code_sha256``, and ``sif_version``.
     """
@@ -508,19 +505,6 @@ async def run_analysis_sandboxed(
 
     code_sha256, code_files = compute_code_hash(work)
 
-    scan_result: Optional[Dict[str, Any]] = None
-    if scan_code:
-        with contextlib.suppress(Exception):
-            from odda_utils.injection_scan import scan_injection_batch
-            items = {rel: (work / rel).read_text("utf-8", "replace") for rel in code_files}
-            batch = scan_injection_batch(items) if items else None
-            if batch is not None:
-                # Reduce to a compact, JSON-friendly signal.
-                scan_result = {
-                    "flagged_labels": list(getattr(batch, "flagged_labels", []) or []),
-                    "max_risk_level": _max_risk_level(batch),
-                }
-
     # ---- Preview phase -----------------------------------------------------
     resolved = resolve_analysis_sif(version)
     planned = None
@@ -542,7 +526,6 @@ async def run_analysis_sandboxed(
             "mode": "preview",
             "code_sha256": code_sha256,
             "code_files": code_files,
-            "injection_scan": scan_result,
             "image": resolved,
             "planned_command": planned,
             "network_isolated": not allow_network,
@@ -599,19 +582,6 @@ async def run_analysis_sandboxed(
         "network_isolated": not allow_network,
         "input_paths": resolved_inputs,
         "output_paths": [str(work)],
-        "injection_scan": scan_result,
         "command": planned,
         **result,
     }
-
-
-def _max_risk_level(batch: Any) -> str:
-    """Extract the highest per-item risk_level from an InjectionScanBatchResult."""
-    order = {"none": 0, "low": 1, "medium": 2, "high": 3}
-    best = "none"
-    results = getattr(batch, "results", None) or {}
-    for r in results.values():
-        lvl = getattr(r, "risk_level", "none")
-        if order.get(lvl, 0) > order.get(best, 0):
-            best = lvl
-    return best

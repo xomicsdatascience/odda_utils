@@ -14,9 +14,7 @@
 # question to the configured chat model and returns a MINIMAL structured
 # judgement -- {score: 0-1, directly_measures: bool, reason: <=8 words}. Output
 # tokens are capped low because output tokens dominate cost. Borderline cases
-# escalate to full text. Because relevance is judged from UNTRUSTED article
-# text, the injection-telemetry scan (odda_utils.injection_scan) is run on the
-# text first, and every judgement -- including errors -- is persisted to
+# escalate to full text. Every judgement -- including errors -- is persisted to
 # ``study_relevance_scores`` so no study is ever silently dropped.
 #
 # Recommended gating policy (encoded in ``gate_verdict`` and returned): auto
@@ -30,7 +28,7 @@ import hashlib
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,7 +40,6 @@ from odda_utils.database import (
     get_measurement_descriptor,
     insert_study_relevance_score,
 )
-from odda_utils.injection_scan import scan_injection
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +53,6 @@ DEFAULT_EXCERPT_CHARS = 4600
 DEFAULT_FULLTEXT_CHARS = 16000
 # Cap on OUTPUT tokens for the minimal JSON judgement.
 DEFAULT_MAX_OUTPUT_TOKENS = 120
-
-# risk_score at/above which the scored text is considered injection-flagged.
-_INJECTION_FLAG_THRESHOLD = 40.0
 
 _METHODS_HEADING = re.compile(
     r"(?i)\b(materials\s+and\s+methods|methods|experimental\s+procedures|"
@@ -116,14 +110,6 @@ class StudyRelevanceResult:
         Resolved stored identifiers for the study, if any.
     study_label : str or None
         Label for a supplied-text study with no stored identifier.
-    injection_risk_score : float
-        Bounded prompt-injection risk score of the scored text.
-    injection_risk_level : str
-        Coarse injection risk level (none/low/medium/high).
-    injection_flagged : bool
-        Whether the injection scan flagged the scored text for review.
-    injection_categories : list of str
-        Injection categories that matched, if any.
     model : str or None
         Chat model that produced the judgement.
     provider : str or None
@@ -146,10 +132,6 @@ class StudyRelevanceResult:
     pmid: Optional[str] = None
     pmcid: Optional[str] = None
     study_label: Optional[str] = None
-    injection_risk_score: float = 0.0
-    injection_risk_level: str = "none"
-    injection_flagged: bool = False
-    injection_categories: list[str] = field(default_factory=list)
     model: Optional[str] = None
     provider: Optional[str] = None
     include_threshold: float = INCLUDE_THRESHOLD
@@ -489,10 +471,10 @@ def score_study_relevance(
     """Score one study's relevance to a research question and gate it.
 
     Sends only a bounded excerpt (or a cached measurement descriptor) plus the
-    question to the configured chat model, capping OUTPUT tokens low. Runs the
-    injection-telemetry scan on the untrusted text first, applies the gating
-    policy, and persists the judgement for provenance. Borderline (flagged)
-    first passes are re-scored against full text when ``escalate`` is True.
+    question to the configured chat model, capping OUTPUT tokens low. Applies
+    the gating policy and persists the judgement for provenance. Borderline
+    (flagged) first passes are re-scored against full text when ``escalate`` is
+    True.
 
     Parameters
     ----------
@@ -536,7 +518,7 @@ def score_study_relevance(
     Returns
     -------
     StudyRelevanceResult
-        The judgement, gating verdict, injection telemetry, and provenance. On
+        The judgement, gating verdict, and provenance. On
         failure the result carries ``verdict="error"`` and an ``error`` message
         (and is still persisted) so the study is never silently dropped.
     """
@@ -577,13 +559,6 @@ def score_study_relevance(
             result.record_id = _persist(conn, result, question, question_sha)
         return result
 
-    # Injection telemetry on the untrusted text that will be sent to the model.
-    scan = scan_injection(context_text, source_label=result.study_label)
-    result.injection_risk_score = scan.risk_score
-    result.injection_risk_level = scan.risk_level
-    result.injection_flagged = scan.risk_score >= _INJECTION_FLAG_THRESHOLD
-    result.injection_categories = list(scan.matched_categories)
-
     try:
         score, directly, reason, provider, model = _score_once(
             question,
@@ -613,16 +588,6 @@ def score_study_relevance(
         ):
             full_context = _build_full_context(resolved, fulltext_chars)
             if full_context.strip() and full_context != context_text:
-                full_scan = scan_injection(
-                    full_context, source_label=result.study_label
-                )
-                result.injection_risk_score = full_scan.risk_score
-                result.injection_risk_level = full_scan.risk_level
-                result.injection_flagged = (
-                    full_scan.risk_score >= _INJECTION_FLAG_THRESHOLD
-                )
-                result.injection_categories = list(full_scan.matched_categories)
-
                 score, directly, reason, provider, model = _score_once(
                     question,
                     full_context,
@@ -697,9 +662,6 @@ def _persist(
             verdict=result.verdict,
             escalated=result.escalated,
             context_level=result.context_level,
-            injection_risk_score=result.injection_risk_score,
-            injection_risk_level=result.injection_risk_level,
-            injection_flagged=result.injection_flagged,
             model=result.model,
             provider=result.provider,
             error=result.error,

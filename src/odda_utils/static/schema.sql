@@ -656,8 +656,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_meas_desc_model ON llm_measurement_descriptor
 -- is ever silently dropped from a cross-study comparison. Records the minimal
 -- LLM judgement (score, directly_measures, reason), the derived gating verdict,
 -- how much context was sent (descriptor/excerpt/full_text), whether the input
--- was escalated to full text, the injection-telemetry signal for the scored
--- text, and the model/provider provenance.
+-- was escalated to full text, and the model/provider provenance.
 CREATE TABLE IF NOT EXISTS study_relevance_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     doi VARCHAR(40),
@@ -672,9 +671,6 @@ CREATE TABLE IF NOT EXISTS study_relevance_scores (
     verdict VARCHAR(10),              -- include | exclude | flag | error
     escalated BOOLEAN DEFAULT FALSE,
     context_level VARCHAR(20),        -- descriptor | excerpt | full_text
-    injection_risk_score REAL,
-    injection_risk_level VARCHAR(10),
-    injection_flagged BOOLEAN DEFAULT FALSE,
     model VARCHAR(100),
     provider VARCHAR(100),
     error TEXT,

@@ -135,14 +135,6 @@ from odda_utils.meta_analysis import (
     PooledEstimate,
     Heterogeneity,
 )
-from odda_utils.injection_scan import (
-    scan_injection as _scan_injection,
-    scan_injection_batch as _scan_injection_batch,
-    InjectionScanResult,
-    InjectionScanBatchResult,
-    CategorySignal,
-    InjectionMatch,
-)
 from odda_utils.relevance import (
     score_study_relevance as _score_study_relevance,
     StudyRelevanceResult,
@@ -3397,97 +3389,6 @@ def meta_analysis(
 
 
 @app.tool()
-def scan_injection(
-    text: Optional[str] = None,
-    source_label: Optional[str] = None,
-    items: Optional[dict[str, str]] = None,
-    flag_threshold: float = 40.0,
-    snippet_len: int = 160,
-    include_snippets: bool = True,
-    max_matches_per_category: int = 50,
-    min_base64_len: int = 48,
-    max_chars: Optional[int] = 2_000_000,
-) -> InjectionScanBatchResult:
-    """Scan untrusted article/supplemental text for prompt-injection patterns.
-
-    Defensive telemetry for the ODDA trust boundary. Extracted text from an
-    article and its supplements is untrusted input; this tool measures it for
-    instruction-like / command-injection patterns directed at an AI so that
-    suspicious inputs can be flagged for human review and the signal stored as a
-    provenance field. It is pure and side-effect-free: it NEVER executes,
-    follows, downloads, or otherwise acts on the scanned content -- it only
-    counts matches and computes a bounded risk score.
-
-    Detected pattern categories:
-    - instruction_override ("ignore previous instructions", "disregard", "forget")
-    - role_manipulation ("as an AI", "system prompt", "developer mode", "jailbreak")
-    - imperative_to_ai ("you must", "you should", "make sure to", "do not reveal")
-    - database_manipulation ("add the keyword", "insert into", "classify as")
-    - tool_command_injection (os.system(, subprocess, eval(, rm -rf, curl ... | sh)
-    - url_exfiltration (URLs, "send/upload the data to ...", IP addresses)
-    - encoded_payload (base64 blobs, long hex strings, \\x escapes, data: URIs)
-
-    Two calling styles are supported (both return the same batch container so
-    callers can treat the output uniformly):
-
-    1. Single text: pass ``text`` (and optionally ``source_label``). The result
-       is keyed by ``source_label`` (or ``"text"``).
-    2. Many texts at once (typical: main text plus each supplemental file): pass
-       ``items`` mapping a label (filename or ``"main_text"``) to its text.
-       Per-item errors are captured on that item and do not abort the batch.
-
-    When both are given, ``items`` takes precedence.
-
-    This is deterministic pattern telemetry, not a classifier; false positives
-    (e.g. a methods section literally discussing a "system prompt") are expected
-    and acceptable because the signal only gates human review, never an
-    automated action on the untrusted text.
-
-    Args:
-        text: A single text to scan (single-text style).
-        source_label: Label for the single text (e.g. a DOI or filename).
-        items: Mapping of label -> text for scanning many texts at once.
-        flag_threshold: risk_score at/above which an item is counted as flagged
-            (default 40.0, the medium-risk cutoff).
-        snippet_len: Maximum length of each returned match snippet.
-        include_snippets: If False, omit match snippets (offsets/counts remain),
-            so the signal can be stored without echoing the payload.
-        max_matches_per_category: Cap on retained spans per category (the
-            reported count is still the true total).
-        min_base64_len: Minimum base64-like run length to flag as encoded_payload.
-        max_chars: Only the leading max_chars characters are scanned (None to
-            scan everything).
-
-    Returns:
-        InjectionScanBatchResult keyed by item label. Each InjectionScanResult
-        holds per-category counts and matched spans, the matched-category list,
-        an unbounded weighted_score, a bounded risk_score in [0, 100], and a
-        coarse risk_level ("none"/"low"/"medium"/"high"). The batch adds flag
-        and error counts and the list of flagged labels.
-    """
-    if items is not None:
-        return _scan_injection_batch(
-            items,
-            flag_threshold=flag_threshold,
-            snippet_len=snippet_len,
-            include_snippets=include_snippets,
-            max_matches_per_category=max_matches_per_category,
-            min_base64_len=min_base64_len,
-            max_chars=max_chars,
-        )
-    label = source_label or "text"
-    return _scan_injection_batch(
-        {label: text or ""},
-        flag_threshold=flag_threshold,
-        snippet_len=snippet_len,
-        include_snippets=include_snippets,
-        max_matches_per_category=max_matches_per_category,
-        min_base64_len=min_base64_len,
-        max_chars=max_chars,
-    )
-
-
-@app.tool()
 def list_analysis_versions() -> dict:
     """List analysis-sandbox container versions available on this host.
 
@@ -3543,9 +3444,9 @@ async def run_analysis(
     Two-phase, review-gated usage:
 
     1. **Preview (default).** Call WITHOUT ``approved_code_sha256``. The tool
-       hashes the ``*.py`` code under ``work_dir``, scans it with the injection
-       telemetry, and returns the hash and the exact command that would run --
-       but does NOT execute. Surface the code and hash for human review.
+       hashes the ``*.py`` code under ``work_dir`` and returns the hash and the
+       exact command that would run -- but does NOT execute. Surface the code
+       and hash for human review.
     2. **Execute.** Re-call with ``approved_code_sha256`` set to the hash from
        step 1. If the code changed since review the hash will not match and the
        run is refused.
@@ -3579,7 +3480,7 @@ async def run_analysis(
     Returns:
         dict: Always has ``ok`` and ``mode`` ("preview" | "executed" |
         "rejected"). Preview includes ``code_sha256``, ``code_files``,
-        ``injection_scan``, ``image``, and ``planned_command``. Execution
+        ``image``, and ``planned_command``. Execution
         includes ``exit_code``, ``stdout``, ``stderr``, ``timed_out``,
         truncation flags, ``code_sha256``, ``sif_version``, and (with ``db_path``)
         ``analysis_run_id``.
@@ -3662,8 +3563,6 @@ def score_study_relevance(
     prevents wrong-compartment / wrong-cell studies (e.g. exosome/secretome,
     whole-tissue, or other-cell proteomes) from contaminating a meta-analysis.
 
-    Because relevance is judged from UNTRUSTED article text, the injection-
-    telemetry scan is run on the text FIRST and its signal is returned/stored.
     Every judgement (including errors) is persisted to ``study_relevance_scores``
     so no study is ever silently dropped. Borderline (flagged) first passes are
     re-scored against full text when ``escalate`` is True.
@@ -3698,9 +3597,8 @@ def score_study_relevance(
     Returns:
         StudyRelevanceResult with the verdict (include/exclude/flag/error),
         score, directly_measures, reason, the context level used, whether the
-        input was escalated to full text, the injection telemetry, model/
-        provider provenance, the gating thresholds, the persisted record id, and
-        any error message.
+        input was escalated to full text, model/provider provenance, the gating
+        thresholds, the persisted record id, and any error message.
     """
     conn = init_db(db_path)
     try:
