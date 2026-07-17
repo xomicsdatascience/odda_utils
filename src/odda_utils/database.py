@@ -5,8 +5,24 @@ CRUD operations on articles, embeddings, authors, affiliations, journals, keywor
 grants, MeSH terms, LLM extractions, supplemental file classifications, datasets,
 and agent requests. Agent requests support status tracking including 'in_progress'
 status with assigned_time timestamp.
+
+It also provides the provenance / research-object layer (Phase 2): insert and
+query helpers for quantification_runs, analysis_runs, dep_results,
+benchmark_annotations, and benchmark_predictions. These record full provenance
+(tool/library versions, container and parameter hashes, commands, hosts, and
+model/provider) so every quantification/analysis result is reproducible. List
+and dict values are stored in JSON TEXT columns via the ``_encode_json`` /
+``_decode_json`` helpers.
+
+It additionally provides the question-conditioned relevance gate (feature
+request #53): cached per-article measurement descriptors
+(``llm_measurement_descriptors``) captured on the existing LLM extraction pass,
+and per-(study, question) relevance judgements (``study_relevance_scores``)
+persisted for provenance so no study is silently dropped from a cross-study
+comparison.
 """
 
+import json
 import re
 import sqlite3
 import struct
@@ -954,6 +970,306 @@ def insert_llm_extraction(
     return cursor.lastrowid
 
 
+def insert_measurement_descriptor(
+    conn: sqlite3.Connection,
+    model: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    biological_system: str | None = None,
+    measured_compartment: str | None = None,
+    species: str | None = None,
+    perturbations: str | None = None,
+    omics_assay: str | None = None,
+    evidence_text: str | None = None,
+) -> int:
+    """Insert or replace an article's measurement descriptor for a model.
+
+    The measurement descriptor is captured on the existing LLM extraction pass
+    and cached so a question-time relevance score can be computed cheaply
+    against it and reused across questions. Upserts on the (id, model) pair so
+    re-extraction refreshes the descriptor in place.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    model : str
+        Name of the LLM model used for extraction.
+    doi, pmid, pmcid : str, optional
+        Article identifiers (at least one should be provided).
+    biological_system : str, optional
+        Biological system / cell type measured.
+    measured_compartment : str, optional
+        Measured compartment (whole-cell | EV/exosome | secretome | tissue |
+        nuclei | cell-type-specific in vivo | other/unknown).
+    species : str, optional
+        Species studied.
+    perturbations : str, optional
+        Perturbations / contrasts studied.
+    omics_assay : str, optional
+        Omics / assay modality.
+    evidence_text : str, optional
+        Supporting text from the article.
+
+    Returns
+    -------
+    int
+        The id of the inserted or updated descriptor row.
+    """
+    # Upsert keyed on whichever identifier is present. INSERT OR REPLACE would
+    # break the AUTOINCREMENT id, so delete any prior row for this id+model
+    # first, then insert.
+    if doi:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE doi = ? AND model = ?",
+            (doi, model),
+        )
+    elif pmid:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE pmid = ? AND model = ?",
+            (pmid, model),
+        )
+    elif pmcid:
+        conn.execute(
+            "DELETE FROM llm_measurement_descriptors WHERE pmcid = ? AND model = ?",
+            (pmcid, model),
+        )
+
+    cursor = conn.execute(
+        """
+        INSERT INTO llm_measurement_descriptors (
+            doi, pmid, pmcid, biological_system, measured_compartment, species,
+            perturbations, omics_assay, evidence_text, model
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doi,
+            pmid,
+            pmcid,
+            biological_system,
+            measured_compartment,
+            species,
+            perturbations,
+            omics_assay,
+            evidence_text,
+            model,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_measurement_descriptor(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    model: str | None = None,
+) -> sqlite3.Row | None:
+    """Retrieve a cached measurement descriptor for an article.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi, pmid, pmcid : str, optional
+        Article identifiers (at least one must be provided).
+    model : str, optional
+        If given, restrict to descriptors produced by this model.
+
+    Returns
+    -------
+    sqlite3.Row or None
+        The most recent matching descriptor row, or None if none exists.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if not conditions:
+        return None
+    where = "(" + " OR ".join(conditions) + ")"
+    if model:
+        where += " AND model = ?"
+        params.append(model)
+    cursor = conn.execute(
+        f"SELECT * FROM llm_measurement_descriptors WHERE {where} "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        params,
+    )
+    return cursor.fetchone()
+
+
+def insert_study_relevance_score(
+    conn: sqlite3.Connection,
+    question: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    study_label: str | None = None,
+    question_sha256: str | None = None,
+    score: float | None = None,
+    directly_measures: bool | None = None,
+    reason: str | None = None,
+    verdict: str | None = None,
+    escalated: bool | None = None,
+    context_level: str | None = None,
+    injection_risk_score: float | None = None,
+    injection_risk_level: str | None = None,
+    injection_flagged: bool | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    error: str | None = None,
+) -> int:
+    """Persist a question-conditioned study relevance judgement for provenance.
+
+    Every judgement is recorded (including errors) so no study is ever silently
+    dropped from a cross-study comparison.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    question : str
+        The research question the study was scored against.
+    doi, pmid, pmcid : str, optional
+        Stored article identifiers, when the study is in the database.
+    study_label : str, optional
+        Label for a supplied-text study that has no stored identifier.
+    question_sha256 : str, optional
+        Hex SHA-256 of the question, for grouping scores by question.
+    score : float, optional
+        Relevance score in [0, 1].
+    directly_measures : bool, optional
+        Whether the study directly measures the requested analyte/compartment.
+    reason : str, optional
+        Short (<=8 word) justification from the model.
+    verdict : str, optional
+        Gating verdict: include | exclude | flag | error.
+    escalated : bool, optional
+        Whether scoring escalated to full text for a borderline case.
+    context_level : str, optional
+        How much context was sent: descriptor | excerpt | full_text.
+    injection_risk_score : float, optional
+        Bounded prompt-injection risk score of the scored text.
+    injection_risk_level : str, optional
+        Coarse injection risk level (none/low/medium/high).
+    injection_flagged : bool, optional
+        Whether the injection scan flagged the scored text.
+    model : str, optional
+        Chat model that produced the judgement.
+    provider : str, optional
+        Provider of the chat model.
+    error : str, optional
+        Error message if the judgement could not be produced.
+
+    Returns
+    -------
+    int
+        The id of the inserted relevance-score row.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO study_relevance_scores (
+            doi, pmid, pmcid, study_label, question, question_sha256, score,
+            directly_measures, reason, verdict, escalated, context_level,
+            injection_risk_score, injection_risk_level, injection_flagged,
+            model, provider, error
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doi,
+            pmid,
+            pmcid,
+            study_label,
+            question,
+            question_sha256,
+            score,
+            None if directly_measures is None else int(bool(directly_measures)),
+            reason,
+            verdict,
+            None if escalated is None else int(bool(escalated)),
+            context_level,
+            injection_risk_score,
+            injection_risk_level,
+            None if injection_flagged is None else int(bool(injection_flagged)),
+            model,
+            provider,
+            error,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_study_relevance_scores(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    question_sha256: str | None = None,
+    verdict: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve persisted study relevance scores, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi, pmid, pmcid : str, optional
+        Filter by stored article identifier.
+    question_sha256 : str, optional
+        Filter by question hash (all studies scored against one question).
+    verdict : str, optional
+        Filter by gating verdict (include/exclude/flag/error).
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching score rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if question_sha256:
+        conditions.append("question_sha256 = ?")
+        params.append(question_sha256)
+    if verdict:
+        conditions.append("verdict = ?")
+        params.append(verdict)
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = (
+        f"SELECT * FROM study_relevance_scores WHERE {where_clause} "
+        "ORDER BY created_at DESC, id DESC"
+    )
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
+
+
 def get_llm_extraction(
     conn: sqlite3.Connection,
     extraction_id: int,
@@ -1674,3 +1990,702 @@ def get_oldest_approved_agent_request(conn: sqlite3.Connection) -> sqlite3.Row |
         """,
     )
     return cursor.fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Provenance / research-object layer (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _encode_json(value: object | None) -> str | None:
+    """Encode a Python object as a JSON string for a ``*_json`` TEXT column.
+
+    Parameters
+    ----------
+    value : object or None
+        A JSON-serializable value (typically a list or dict). If already a
+        string it is stored verbatim.
+
+    Returns
+    -------
+    str or None
+        The JSON-encoded string, or None if ``value`` is None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _decode_json(text: str | None) -> object | None:
+    """Decode a JSON string from a ``*_json`` TEXT column into a Python object.
+
+    Parameters
+    ----------
+    text : str or None
+        The stored JSON text.
+
+    Returns
+    -------
+    object or None
+        The decoded Python object, or None if ``text`` is None or invalid JSON.
+    """
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def insert_quantification_run(
+    conn: sqlite3.Connection,
+    dataset_id: str | None = None,
+    tool: str | None = None,
+    tool_version: str | None = None,
+    container_image: str | None = None,
+    container_sha256: str | None = None,
+    param_file_path: str | None = None,
+    param_file_sha256: str | None = None,
+    command: str | None = None,
+    input_files: list | dict | str | None = None,
+    output_dir: str | None = None,
+    exit_status: int | None = None,
+    wall_time_sec: float | None = None,
+    host: str | None = None,
+    extraction_model: str | None = None,
+    provider: str | None = None,
+) -> int:
+    """Insert a quantification run provenance record.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    dataset_id : str, optional
+        Source dataset identifier (e.g., "PXD012345").
+    tool : str, optional
+        Quantification tool name (e.g., "DIA-NN", "MaxQuant").
+    tool_version : str, optional
+        Version string of the tool.
+    container_image : str, optional
+        Container image reference (name:tag) used for the run.
+    container_sha256 : str, optional
+        SHA-256 digest of the container image.
+    param_file_path : str, optional
+        Path to the parameter/config file used.
+    param_file_sha256 : str, optional
+        SHA-256 hash of the parameter file contents.
+    command : str, optional
+        Full command line executed.
+    input_files : list or dict or str, optional
+        Input file paths; stored as JSON in ``input_files_json``.
+    output_dir : str, optional
+        Directory where outputs were written.
+    exit_status : int, optional
+        Process exit status code.
+    wall_time_sec : float, optional
+        Wall-clock run time in seconds.
+    host : str, optional
+        Host/machine identifier where the run executed.
+    extraction_model : str, optional
+        LLM model used to derive parameters, if any.
+    provider : str, optional
+        LLM/compute provider (e.g., "azure").
+
+    Returns
+    -------
+    int
+        The ID of the inserted quantification run.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO quantification_runs (
+            dataset_id, tool, tool_version, container_image, container_sha256,
+            param_file_path, param_file_sha256, command, input_files_json,
+            output_dir, exit_status, wall_time_sec, host, extraction_model, provider
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            dataset_id, tool, tool_version, container_image, container_sha256,
+            param_file_path, param_file_sha256, command, _encode_json(input_files),
+            output_dir, exit_status, wall_time_sec, host, extraction_model, provider,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_quantification_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> sqlite3.Row | None:
+    """Retrieve a quantification run by ID.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    run_id : int
+        The quantification run ID.
+
+    Returns
+    -------
+    sqlite3.Row or None
+        The quantification run row, or None if not found.
+    """
+    cursor = conn.execute(
+        "SELECT * FROM quantification_runs WHERE id = ?",
+        (run_id,),
+    )
+    return cursor.fetchone()
+
+
+def get_quantification_runs(
+    conn: sqlite3.Connection,
+    dataset_id: str | None = None,
+    tool: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve quantification runs, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    dataset_id : str, optional
+        Filter by source dataset identifier.
+    tool : str, optional
+        Filter by tool name.
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching quantification run rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if dataset_id:
+        conditions.append("dataset_id = ?")
+        params.append(dataset_id)
+    if tool:
+        conditions.append("tool = ?")
+        params.append(tool)
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = f"SELECT * FROM quantification_runs WHERE {where_clause} ORDER BY created_at DESC, id DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
+
+
+def insert_analysis_run(
+    conn: sqlite3.Connection,
+    analysis_type: str | None = None,
+    method: str | None = None,
+    quantification_run_id: int | None = None,
+    library: str | None = None,
+    library_version: str | None = None,
+    parameters: dict | list | str | None = None,
+    code_sha256: str | None = None,
+    random_seed: int | None = None,
+    input_paths: list | dict | str | None = None,
+    output_paths: list | dict | str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> int:
+    """Insert an analysis run provenance record.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    analysis_type : str, optional
+        Type of analysis (e.g., "QC", "DE", "enrichment").
+    method : str, optional
+        Method/algorithm name.
+    quantification_run_id : int, optional
+        ID of the quantification run that produced the analyzed inputs.
+    library : str, optional
+        Analysis library/package name.
+    library_version : str, optional
+        Version of the analysis library.
+    parameters : dict or list or str, optional
+        Analysis parameters; stored as JSON in ``parameters_json``.
+    code_sha256 : str, optional
+        SHA-256 hash of the analysis code.
+    random_seed : int, optional
+        Random seed used for reproducibility.
+    input_paths : list or dict or str, optional
+        Input paths; stored as JSON in ``input_paths_json``.
+    output_paths : list or dict or str, optional
+        Output paths; stored as JSON in ``output_paths_json``.
+    provider : str, optional
+        LLM/compute provider, if any.
+    model : str, optional
+        LLM model used, if any.
+
+    Returns
+    -------
+    int
+        The ID of the inserted analysis run.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO analysis_runs (
+            quantification_run_id, analysis_type, method, library, library_version,
+            parameters_json, code_sha256, random_seed, input_paths_json,
+            output_paths_json, provider, model
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            quantification_run_id, analysis_type, method, library, library_version,
+            _encode_json(parameters), code_sha256, random_seed,
+            _encode_json(input_paths), _encode_json(output_paths), provider, model,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_analysis_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> sqlite3.Row | None:
+    """Retrieve an analysis run by ID.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    run_id : int
+        The analysis run ID.
+
+    Returns
+    -------
+    sqlite3.Row or None
+        The analysis run row, or None if not found.
+    """
+    cursor = conn.execute(
+        "SELECT * FROM analysis_runs WHERE id = ?",
+        (run_id,),
+    )
+    return cursor.fetchone()
+
+
+def get_analysis_runs(
+    conn: sqlite3.Connection,
+    quantification_run_id: int | None = None,
+    analysis_type: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve analysis runs, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    quantification_run_id : int, optional
+        Filter by parent quantification run ID.
+    analysis_type : str, optional
+        Filter by analysis type.
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching analysis run rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if quantification_run_id is not None:
+        conditions.append("quantification_run_id = ?")
+        params.append(quantification_run_id)
+    if analysis_type:
+        conditions.append("analysis_type = ?")
+        params.append(analysis_type)
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = f"SELECT * FROM analysis_runs WHERE {where_clause} ORDER BY created_at DESC, id DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
+
+
+def insert_dep_result(
+    conn: sqlite3.Connection,
+    analysis_run_id: int,
+    feature_id: str | None = None,
+    log2fc: float | None = None,
+    pvalue: float | None = None,
+    padj: float | None = None,
+    direction: str | None = None,
+    significant: bool | None = None,
+) -> int:
+    """Insert a single differential expression result row.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    analysis_run_id : int
+        ID of the analysis run that produced this result.
+    feature_id : str, optional
+        Feature identifier (protein/peptide/gene).
+    log2fc : float, optional
+        Log2 fold change.
+    pvalue : float, optional
+        Raw p-value.
+    padj : float, optional
+        Adjusted p-value (e.g., BH-corrected).
+    direction : str, optional
+        Direction of change (e.g., "up", "down").
+    significant : bool, optional
+        Whether the feature is significant.
+
+    Returns
+    -------
+    int
+        The ID of the inserted result row.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO dep_results (
+            analysis_run_id, feature_id, log2fc, pvalue, padj, direction, significant
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            analysis_run_id, feature_id, log2fc, pvalue, padj, direction,
+            None if significant is None else int(bool(significant)),
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_dep_results(
+    conn: sqlite3.Connection,
+    analysis_run_id: int,
+    results: list[dict],
+) -> list[int]:
+    """Insert multiple differential expression result rows.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    analysis_run_id : int
+        ID of the analysis run that produced these results.
+    results : list of dict
+        Each dict may contain keys: ``feature_id``, ``log2fc``, ``pvalue``,
+        ``padj``, ``direction``, ``significant``.
+
+    Returns
+    -------
+    list[int]
+        IDs of the inserted result rows, in input order.
+    """
+    ids: list[int] = []
+    for r in results:
+        significant = r.get("significant")
+        cursor = conn.execute(
+            """
+            INSERT INTO dep_results (
+                analysis_run_id, feature_id, log2fc, pvalue, padj, direction, significant
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                analysis_run_id,
+                r.get("feature_id"),
+                r.get("log2fc"),
+                r.get("pvalue"),
+                r.get("padj"),
+                r.get("direction"),
+                None if significant is None else int(bool(significant)),
+            ),
+        )
+        ids.append(cursor.lastrowid)
+    conn.commit()
+    return ids
+
+
+def get_dep_results(
+    conn: sqlite3.Connection,
+    analysis_run_id: int,
+    significant_only: bool = False,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve differential expression results for an analysis run.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    analysis_run_id : int
+        The analysis run ID to fetch results for.
+    significant_only : bool, optional
+        If True, only return rows flagged as significant.
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching result rows, ordered by adjusted p-value.
+    """
+    params: list = [analysis_run_id]
+    query = "SELECT * FROM dep_results WHERE analysis_run_id = ?"
+    if significant_only:
+        query += " AND significant = 1"
+    query += " ORDER BY (padj IS NULL), padj ASC, id ASC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
+
+
+def insert_benchmark_annotation(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    dataset_id: str | None = None,
+    annotator: str | None = None,
+    label: str | None = None,
+    category: str | None = None,
+    evidence_text: str | None = None,
+) -> int:
+    """Insert a benchmark (ground-truth) annotation record.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi : str, optional
+        Article DOI.
+    pmid : str, optional
+        Article PMID.
+    pmcid : str, optional
+        Article PMCID.
+    dataset_id : str, optional
+        Associated dataset identifier.
+    annotator : str, optional
+        Name/identifier of the annotator.
+    label : str, optional
+        The ground-truth label.
+    category : str, optional
+        Category/task the label belongs to.
+    evidence_text : str, optional
+        Supporting evidence for the annotation.
+
+    Returns
+    -------
+    int
+        The ID of the inserted annotation.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO benchmark_annotations (
+            doi, pmid, pmcid, dataset_id, annotator, label, category, evidence_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (doi, pmid, pmcid, dataset_id, annotator, label, category, evidence_text),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_benchmark_annotations(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    dataset_id: str | None = None,
+    category: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve benchmark annotations, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi : str, optional
+        Filter by article DOI.
+    pmid : str, optional
+        Filter by article PMID.
+    pmcid : str, optional
+        Filter by article PMCID.
+    dataset_id : str, optional
+        Filter by dataset identifier.
+    category : str, optional
+        Filter by category.
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching annotation rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if dataset_id:
+        conditions.append("dataset_id = ?")
+        params.append(dataset_id)
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = f"SELECT * FROM benchmark_annotations WHERE {where_clause} ORDER BY created_at DESC, id DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()
+
+
+def insert_benchmark_prediction(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    dataset_id: str | None = None,
+    predicted_label: str | None = None,
+    confidence: float | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    run_at: str | None = None,
+) -> int:
+    """Insert a benchmark prediction record.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi : str, optional
+        Article DOI.
+    pmid : str, optional
+        Article PMID.
+    pmcid : str, optional
+        Article PMCID.
+    dataset_id : str, optional
+        Associated dataset identifier.
+    predicted_label : str, optional
+        The predicted label.
+    confidence : float, optional
+        Confidence score for the prediction.
+    model : str, optional
+        Model that produced the prediction.
+    provider : str, optional
+        Provider of the model (e.g., "azure").
+    run_at : str, optional
+        Timestamp when the prediction was produced. If None, the row's
+        ``created_at`` still records insertion time.
+
+    Returns
+    -------
+    int
+        The ID of the inserted prediction.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO benchmark_predictions (
+            doi, pmid, pmcid, dataset_id, predicted_label, confidence,
+            model, provider, run_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (doi, pmid, pmcid, dataset_id, predicted_label, confidence, model, provider, run_at),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_benchmark_predictions(
+    conn: sqlite3.Connection,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+    dataset_id: str | None = None,
+    model: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Retrieve benchmark predictions, optionally filtered.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Database connection.
+    doi : str, optional
+        Filter by article DOI.
+    pmid : str, optional
+        Filter by article PMID.
+    pmcid : str, optional
+        Filter by article PMCID.
+    dataset_id : str, optional
+        Filter by dataset identifier.
+    model : str, optional
+        Filter by model.
+    limit : int, optional
+        Maximum number of rows to return.
+
+    Returns
+    -------
+    list[sqlite3.Row]
+        Matching prediction rows, newest first.
+    """
+    conditions = []
+    params: list = []
+    if doi:
+        conditions.append("doi = ?")
+        params.append(doi)
+    if pmid:
+        conditions.append("pmid = ?")
+        params.append(pmid)
+    if pmcid:
+        conditions.append("pmcid = ?")
+        params.append(pmcid)
+    if dataset_id:
+        conditions.append("dataset_id = ?")
+        params.append(dataset_id)
+    if model:
+        conditions.append("model = ?")
+        params.append(model)
+
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    query = f"SELECT * FROM benchmark_predictions WHERE {where_clause} ORDER BY created_at DESC, id DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor = conn.execute(query, params)
+    return cursor.fetchall()

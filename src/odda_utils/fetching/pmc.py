@@ -4,6 +4,14 @@ Provides functions to search PubMed, fetch article metadata, download full text
 and supplemental materials from the PMC Open Access subset, and fall back to
 Europe PMC's rendering service for articles that have a PMCID but are not in
 the OA subset.
+
+The PMC OA service (oa.fcgi) still advertises legacy
+``ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/`` URLs even though NCBI
+relocated all OA packages to ``/pub/pmc/deprecated/oa_package/`` (effective
+2026-04-10). Downloads therefore rewrite the advertised path to a set of
+candidate locations (deprecated and original paths, HTTPS preferred over FTP)
+and try them in order, so ingestion keeps working now and stays robust if NCBI
+later restores or re-relocates the packages.
 """
 
 import ftplib
@@ -30,7 +38,16 @@ PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 EUROPEPMC_RENDER_URL = "https://europepmc.org/backend/ptpmcrender.fcgi"
 
+# NCBI relocated all PMC OA packages under /pub/pmc/ to a "deprecated"
+# subdirectory (effective 2026-04-10) but oa.fcgi still advertises the old
+# path. These markers are used to rewrite advertised URLs to the current
+# location while keeping the original path as a fallback.
+PMC_FTP_HOST = "ftp.ncbi.nlm.nih.gov"
+PMC_ORIGINAL_PREFIX = "/pub/pmc/"
+PMC_DEPRECATED_PREFIX = "/pub/pmc/deprecated/"
+
 DateType = Literal["edat", "pdat", "mdat"]
+SearchDb = Literal["pubmed", "pmc"]
 
 
 @dataclass
@@ -72,26 +89,37 @@ def search_pubmed(
     end_date: date | str | None = None,
     date_type: DateType = "edat",
     max_results: int = 10000,
+    db: SearchDb = "pubmed",
 ) -> list[str]:
-    """Search PubMed for articles matching a query.
+    """Search an NCBI Entrez database for articles matching a query.
 
     Args:
-        query: PubMed articles query string.
+        query: Entrez query string. When ``db="pmc"``, PMC full-text field
+            tags such as ``[body]`` are supported; these are silently ignored
+            (not errors) by ``db="pubmed"``, so a full-text query must use
+            ``db="pmc"`` to search the intended corpus.
         start_date: Start date for filtering (inclusive). Can be date object or
             string in YYYY/MM/DD or YYYY format.
         end_date: End date for filtering (inclusive). Can be date object or
             string in YYYY/MM/DD or YYYY format.
         date_type: Type of date to filter on:
-            - "edat": Entrez date (date added to PubMed)
+            - "edat": Entrez date (date added to the database)
             - "pdat": Publication date
             - "mdat": Modification date
         max_results: Maximum number of results to return (default 10000).
+        db: Entrez database to search. Either ``"pubmed"`` (default) or
+            ``"pmc"`` (PubMed Central).
 
     Returns:
-        List of PubMed IDs (PMIDs) matching the query.
+        List of record UIDs matching the query. For ``db="pubmed"`` these are
+        PMIDs; for ``db="pmc"`` these are PMC UIDs (bare numeric IDs, i.e. the
+        digits of a ``PMC...`` accession without the ``PMC`` prefix).
     """
+    if db not in ("pubmed", "pmc"):
+        raise ValueError(f"db must be 'pubmed' or 'pmc', got {db!r}")
+
     params = {
-        "db": "pubmed",
+        "db": db,
         "term": query,
         "retmode": "json",
         "retmax": max_results,
@@ -284,20 +312,31 @@ def download_pmc_article(
 
     # Query PMC OA service for download links
     oa_links = _get_oa_links(article_ids.pmcid)
-    if oa_links is not None:
-        result = DownloadResult(article_ids=article_ids, source="pmc_oa")
-
-        # Download and extract article text from PMC OA archive
-        if oa_links.get("tgz"):
+    if oa_links is not None and oa_links.get("tgz"):
+        # Download and extract article text from PMC OA archive. The advertised
+        # URL may point at the relocated (deprecated) path; _download_and_extract
+        # tries the appropriate candidate locations. If the archive cannot be
+        # retrieved at all, fall through to the Europe PMC fallback rather than
+        # failing the whole article.
+        try:
             text_path, suppl_path = _download_and_extract(
                 oa_links["tgz"],
                 output_dir,
                 article_ids.pmcid,
             )
-            result.text_filepath = text_path
-            result.supplementals_filepath = suppl_path
-
-        return result
+            return DownloadResult(
+                article_ids=article_ids,
+                text_filepath=text_path,
+                supplementals_filepath=suppl_path,
+                source="pmc_oa",
+            )
+        except Exception as e:
+            logger.warning(
+                "PMC OA archive download failed for %s (%s); "
+                "trying Europe PMC fallback",
+                article_ids.pmcid,
+                e,
+            )
 
     # PMC OA not available -- try Europe PMC as fallback
     logger.info(
@@ -515,6 +554,114 @@ def _get_oa_links(pmcid: str) -> dict[str, str] | None:
     return links if links else None
 
 
+def _pmc_download_candidates(url: str) -> list[str]:
+    """Build an ordered list of candidate download URLs for a PMC OA file.
+
+    The PMC OA service advertises legacy
+    ``ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/...`` URLs that now fail
+    because the packages were relocated to ``/pub/pmc/deprecated/oa_package/``.
+    This function rewrites the advertised URL into a set of candidate locations
+    covering both the deprecated (current) and original (in case NCBI restores
+    them) paths, over HTTPS (preferred) and FTP.
+
+    Candidates are returned in preference order:
+
+    1. HTTPS at the deprecated path (the current working location)
+    2. HTTPS at the original path (works if NCBI restores the packages)
+    3. FTP at the deprecated path
+    4. FTP at the original path
+
+    For URLs that are not under ``/pub/pmc/`` (nothing to relocate) the original
+    URL is returned unchanged as the single candidate.
+
+    Parameters
+    ----------
+    url : str
+        The URL advertised by the PMC OA service (``ftp`` or ``https``).
+
+    Returns
+    -------
+    list of str
+        Ordered, de-duplicated candidate URLs to try.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or PMC_FTP_HOST
+    path = parsed.path
+
+    if not path.startswith(PMC_ORIGINAL_PREFIX):
+        # Not a relocatable PMC path; leave the URL as advertised.
+        return [url]
+
+    # Derive both the deprecated and original path variants.
+    if path.startswith(PMC_DEPRECATED_PREFIX):
+        deprecated_path = path
+        original_path = PMC_ORIGINAL_PREFIX + path[len(PMC_DEPRECATED_PREFIX) :]
+    else:
+        original_path = path
+        deprecated_path = PMC_DEPRECATED_PREFIX + path[len(PMC_ORIGINAL_PREFIX) :]
+
+    candidates: list[str] = []
+    # HTTPS preferred over FTP; deprecated (current) path tried before original.
+    for scheme in ("https", "ftp"):
+        for variant in (deprecated_path, original_path):
+            candidates.append(f"{scheme}://{host}{variant}")
+
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+
+    return ordered
+
+
+def _download_pmc_file(url: str, dest_path: str, timeout: int = 120) -> str:
+    """Download a PMC OA file, trying relocated/candidate URLs in order.
+
+    Resolves the advertised URL to its candidate locations (see
+    :func:`_pmc_download_candidates`) and downloads the first candidate that
+    succeeds. This transparently handles NCBI's relocation of OA packages from
+    ``/pub/pmc/oa_package/`` to ``/pub/pmc/deprecated/oa_package/``.
+
+    Parameters
+    ----------
+    url : str
+        URL advertised by the PMC OA service.
+    dest_path : str
+        Local path to save the downloaded file.
+    timeout : int
+        Per-request timeout in seconds.
+
+    Returns
+    -------
+    str
+        The candidate URL that was successfully used.
+
+    Raises
+    ------
+    Exception
+        The last error encountered if every candidate URL fails.
+    """
+    candidates = _pmc_download_candidates(url)
+    last_error: Exception | None = None
+
+    for candidate in candidates:
+        try:
+            _download_file(candidate, dest_path, timeout=timeout)
+            logger.info("Downloaded PMC OA file from %s", candidate)
+            return candidate
+        except Exception as e:  # noqa: BLE001 - try the next candidate location
+            last_error = e
+            logger.warning("PMC OA download candidate failed (%s): %s", candidate, e)
+
+    # All candidates failed; surface the last error to the caller.
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"No download candidates could be built for URL: {url}")
+
+
 def _download_file(url: str, dest_path: str, timeout: int = 120) -> None:
     """Download a file from HTTP(S) or FTP URL.
 
@@ -548,7 +695,9 @@ def _download_and_extract(
     """Download and extract article archive.
 
     Args:
-        tgz_url: URL to the .tar.gz archive (supports http, https, ftp).
+        tgz_url: URL to the .tar.gz archive as advertised by the OA service
+            (supports http, https, ftp). The URL is resolved to its current
+            (relocated) location before downloading.
         output_dir: Directory to save extracted files.
         pmcid: PubMed Central ID for naming files.
 
@@ -561,8 +710,9 @@ def _download_and_extract(
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         tmp_path = tmp.name
 
-    # Download the archive
-    _download_file(tgz_url, tmp_path)
+    # Download the archive, resolving the advertised (possibly relocated) URL
+    # to a working candidate location.
+    _download_pmc_file(tgz_url, tmp_path)
 
     try:
         with tarfile.open(tmp_path, "r:gz") as tar:

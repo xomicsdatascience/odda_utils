@@ -25,7 +25,6 @@ from odda_utils.database import (
     _blob_to_embedding,
 )
 from odda_utils.metadata import logger
-from openai import AzureOpenAI
 
 NCBI_ID_CONVERTER_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 
@@ -212,36 +211,38 @@ def get_text_embedding(
     deployment_name: str = "text-embedding-3-small",
     api_version: str = "2024-02-01",
 ) -> list[float]:
-    """Get text embedding from Azure OpenAI.
+    """Get a text embedding via the configured embedding provider.
+
+    Delegates to the provider-agnostic :mod:`odda_utils.llm` abstraction. The
+    ``endpoint_file``, ``api_key_file``, ``deployment_name`` and ``api_version``
+    arguments are Azure-OpenAI hints, preserved for backward compatibility; they
+    are honoured only when the resolved embedding provider is ``azure_openai``.
 
     Args:
         text: The text to embed.
         endpoint_file: Path to file containing the Azure OpenAI endpoint URL.
         api_key_file: Path to file containing the Azure OpenAI API key.
-        deployment_name: Name of the embedding model deployment in Azure.
+        deployment_name: Name of the embedding model deployment (azure_openai).
         api_version: Azure OpenAI API version.
 
     Returns:
         List of floats representing the embedding vector.
 
     Raises:
-        AzureCredentialsError: If credentials cannot be found.
-        openai.OpenAIError: If the API request fails.
+        odda_utils.llm.ModelConfigError: If no embedding provider is configured.
+        odda_utils.llm.LLMProviderError: If the embedding request fails.
     """
-    endpoint, api_key = get_azure_credentials(endpoint_file, api_key_file)
+    # Imported lazily to avoid a circular import (llm imports from utils).
+    from odda_utils import llm
 
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
+    result = llm.embed(
+        text,
+        endpoint_file=endpoint_file,
+        api_key_file=api_key_file,
+        model=deployment_name,
         api_version=api_version,
     )
-
-    response = client.embeddings.create(
-        input=text,
-        model=deployment_name,
-    )
-
-    return response.data[0].embedding
+    return result.vector
 
 
 def check_existing_article(

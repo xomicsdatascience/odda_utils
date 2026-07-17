@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Local data / secrets
+*.sqlite
+*.sqlite-journal
+.env
+*.key
+.claude/*.key
+.claude/*.endpoint
+
+# Built Apptainer images (large; rebuild from static/apptainer/*.def).
+# The definition files and build scripts ARE tracked; the .sif images are not.
+*.sif

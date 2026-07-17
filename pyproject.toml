@@ -54,7 +54,7 @@ odda = "odda_utils.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-odda_utils = ["static/*"]
+odda_utils = ["static/*", "static/apptainer/*.def", "static/apptainer/*.sh"]
 
 [tool.setuptools.dynamic]
 version = {attr = "odda_utils.__version__"}

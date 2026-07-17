@@ -2,11 +2,12 @@
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openai import AzureOpenAI
+from odda_utils import llm
 
 from odda_utils.database import (
     get_article,
@@ -14,6 +15,7 @@ from odda_utils.database import (
     get_article_by_pmid,
     init_db,
     insert_llm_extraction,
+    insert_measurement_descriptor,
     insert_or_get_llm_keyword,
     link_article_llm_keyword,
 )
@@ -21,6 +23,7 @@ from odda_utils.prompts import (
     analysis_methods,
     code_prompt,
     keyword_data_prompt,
+    measurement_descriptor_prompt,
     postamble,
     preamble,
     processed_data_prompt,
@@ -88,6 +91,35 @@ class CodeEntry:
 
 
 @dataclass
+class MeasurementDescriptor:
+    """Ingestion-time descriptor of what a study measures.
+
+    Captured on the existing LLM extraction pass (near-zero marginal cost) and
+    cached so a question-conditioned relevance score can be computed cheaply
+    against it and reused across questions.
+    """
+
+    biological_system: str | None = None
+    measured_compartment: str | None = None
+    species: str | None = None
+    perturbations: str | None = None
+    omics_assay: str | None = None
+    evidence_text: str | None = None
+
+    def is_empty(self) -> bool:
+        """Return True when no descriptor field was populated."""
+        return not any(
+            (
+                self.biological_system,
+                self.measured_compartment,
+                self.species,
+                self.perturbations,
+                self.omics_assay,
+            )
+        )
+
+
+@dataclass
 class ExtractedMetadata:
     """Container for all extracted metadata."""
 
@@ -96,6 +128,7 @@ class ExtractedMetadata:
     processed_data: list[ProcessedDataEntry] = field(default_factory=list)
     analysis_methods: list[AnalysisMethod] = field(default_factory=list)
     code: list[CodeEntry] = field(default_factory=list)
+    measurement_descriptor: MeasurementDescriptor | None = None
     raw_response: str | None = None
     model: str | None = None
 
@@ -107,6 +140,7 @@ def build_extraction_prompt(
     include_processed_data: bool = True,
     include_analysis_methods: bool = True,
     include_code: bool = True,
+    include_measurement_descriptor: bool = True,
 ) -> str:
     """Build the full extraction prompt from subsections.
 
@@ -117,6 +151,10 @@ def build_extraction_prompt(
         include_processed_data: Whether to include processed data extraction.
         include_analysis_methods: Whether to include analysis methods extraction.
         include_code: Whether to include code extraction.
+        include_measurement_descriptor: Whether to include the measurement
+            descriptor (biological system/cell type, measured compartment,
+            species, perturbations/contrasts, omics/assay) used by the
+            question-conditioned relevance gate.
 
     Returns:
         The complete prompt string.
@@ -133,11 +171,19 @@ def build_extraction_prompt(
         parts.append(analysis_methods.strip())
     if include_code:
         parts.append(code_prompt.strip())
+    if include_measurement_descriptor:
+        parts.append(measurement_descriptor_prompt.strip())
 
     parts.append(postamble.strip())
     parts.append(text)
 
     return "\n\n".join(parts)
+
+
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a scientific data extraction assistant. Extract structured "
+    "information from scientific articles and return the results as valid JSON."
+)
 
 
 def call_llm(
@@ -149,16 +195,22 @@ def call_llm(
     max_tokens: int = 16384,
     temperature: float = 1.0,
 ) -> str:
-    """Call Azure OpenAI LLM with the given prompt.
+    """Call the configured chat LLM with the given prompt.
+
+    Delegates to the provider-agnostic :mod:`odda_utils.llm` abstraction. The
+    ``endpoint``, ``api_key``, ``model`` and ``api_version`` arguments are
+    Azure-OpenAI hints preserved for backward compatibility; they are honoured
+    only when the resolved chat provider is ``azure_openai``. For other
+    providers (e.g. Claude via Azure) the configured credentials/model are used.
 
     Args:
         prompt: The prompt to send to the LLM.
-        endpoint: Azure OpenAI endpoint URL.
-        api_key: Azure OpenAI API key.
-        model: Name of the model deployment in Azure.
+        endpoint: Azure OpenAI endpoint URL (azure_openai hint).
+        api_key: Azure OpenAI API key (azure_openai hint).
+        model: Name of the model deployment (azure_openai hint).
         api_version: Azure OpenAI API version.
         max_tokens: Maximum tokens in the response.
-        temperature: Sampling temperature (0.0 for deterministic).
+        temperature: Sampling temperature (OpenAI-family providers only).
 
     Returns:
         The LLM response text.
@@ -166,53 +218,141 @@ def call_llm(
     Raises:
         LLMExtractionError: If the LLM call fails.
     """
-    client = AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version,
-    )
-
     try:
-        # Try with max_completion_tokens first (newer API format)
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a scientific data extraction assistant. "
-                        "Extract structured information from scientific articles and "
-                        "return the results as valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=max_tokens,
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            # Fall back to max_tokens for older models
-            if "max_completion_tokens" in str(e) or "unsupported_parameter" in str(e):
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a scientific data extraction assistant. "
-                            "Extract structured information from scientific articles and "
-                            "return the results as valid JSON.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                raise
-        return response.choices[0].message.content
+        result = llm.complete_json(
+            prompt,
+            system=_EXTRACTION_SYSTEM_PROMPT,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            api_version=api_version,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
     except Exception as e:
         raise LLMExtractionError(f"LLM call failed: {e}") from e
+    return result.text
+
+
+# Mapping of canonical data-entry field names to the set of normalized key
+# variants an LLM might emit for that field. Keys are normalized with
+# ``_normalize_key`` (lowercased, non-alphanumeric runs collapsed to a single
+# underscore) before lookup, so entries such as ``"dataset ID"``,
+# ``"Dataset-Id"`` or ``"data repository"`` all resolve to their canonical name.
+_ENTRY_KEY_ALIASES: dict[str, set[str]] = {
+    "dataset_id": {
+        "dataset_id",
+        "datasetid",
+        "dataset",
+        "dataset_accession",
+        "dataset_identifier",
+        "dataset_number",
+        "accession",
+        "accession_number",
+        "accession_no",
+        "accession_id",
+        "identifier",
+        "id",
+        "data_id",
+    },
+    "data_repository": {
+        "data_repository",
+        "repository",
+        "repo",
+        "database",
+        "data_repo",
+        "database_name",
+        "repository_name",
+        "source_repository",
+        "data_source",
+        "source",
+    },
+    "url": {
+        "url",
+        "uri",
+        "link",
+        "web_link",
+        "weblink",
+        "hyperlink",
+        "address",
+    },
+    "file": {
+        "file",
+        "filename",
+        "file_name",
+        "files",
+        "file_path",
+    },
+    "evidence_text": {
+        "evidence_text",
+        "evidence",
+        "evidence_quote",
+        "quote",
+        "supporting_text",
+        "evidence_sentence",
+    },
+}
+
+# Reverse lookup from a normalized key variant to its canonical field name.
+_ALIAS_TO_CANONICAL: dict[str, str] = {
+    variant: canonical
+    for canonical, variants in _ENTRY_KEY_ALIASES.items()
+    for variant in variants
+}
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a JSON key for tolerant matching.
+
+    Lowercases the key and collapses every run of non-alphanumeric characters
+    (spaces, hyphens, punctuation) into a single underscore, then strips
+    leading/trailing underscores. For example ``"Dataset ID"`` and
+    ``"dataset-id"`` both normalize to ``"dataset_id"``.
+
+    Parameters
+    ----------
+    key : str
+        The raw key from the LLM response.
+
+    Returns
+    -------
+    str
+        The normalized key.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+
+
+def _normalize_entry_keys(entry: dict) -> dict:
+    """Resolve an entry's keys to canonical data-entry field names.
+
+    Each key is normalized with :func:`_normalize_key` and mapped through
+    :data:`_ALIAS_TO_CANONICAL`. Keys without a known alias are retained under
+    their normalized form so no data is silently lost. When multiple source
+    keys resolve to the same canonical field, the first non-empty value wins,
+    which preserves the exact snake_case value if it is present.
+
+    Parameters
+    ----------
+    entry : dict
+        A single raw or processed data entry from the LLM response.
+
+    Returns
+    -------
+    dict
+        A mapping of canonical (or normalized) field names to values.
+    """
+    normalized: dict = {}
+    for raw_key, value in entry.items():
+        norm = _normalize_key(raw_key)
+        canonical = _ALIAS_TO_CANONICAL.get(norm, norm)
+        existing = normalized.get(canonical)
+        # Keep the first value seen for a canonical field, but let a non-empty
+        # value replace a previously stored empty/None one.
+        if canonical not in normalized or (
+            existing in (None, "") and value not in (None, "")
+        ):
+            normalized[canonical] = value
+    return normalized
 
 
 def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
@@ -249,31 +389,39 @@ def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
         raw_data = data["raw_data"]
         if isinstance(raw_data, list):
             for entry in raw_data:
-                if isinstance(entry, dict) and "dataset_id" in entry:
-                    result.raw_data.append(
-                        RawDataEntry(
-                            dataset_id=str(entry.get("dataset_id", "")),
-                            data_repository=str(entry.get("data_repository", "")),
-                            url=entry.get("url"),
-                            evidence_text=entry.get("evidence_text"),
-                        )
+                if not isinstance(entry, dict):
+                    continue
+                norm = _normalize_entry_keys(entry)
+                if "dataset_id" not in norm:
+                    continue
+                result.raw_data.append(
+                    RawDataEntry(
+                        dataset_id=str(norm.get("dataset_id") or ""),
+                        data_repository=str(norm.get("data_repository") or ""),
+                        url=norm.get("url"),
+                        evidence_text=norm.get("evidence_text"),
                     )
+                )
 
     # Parse processed data
     if "processed_data" in data:
         processed_data = data["processed_data"]
         if isinstance(processed_data, list):
             for entry in processed_data:
-                if isinstance(entry, dict) and "dataset_id" in entry:
-                    result.processed_data.append(
-                        ProcessedDataEntry(
-                            dataset_id=str(entry.get("dataset_id", "")),
-                            data_repository=str(entry.get("data_repository", "")),
-                            url=entry.get("url"),
-                            file=entry.get("file"),
-                            evidence_text=entry.get("evidence_text"),
-                        )
+                if not isinstance(entry, dict):
+                    continue
+                norm = _normalize_entry_keys(entry)
+                if "dataset_id" not in norm:
+                    continue
+                result.processed_data.append(
+                    ProcessedDataEntry(
+                        dataset_id=str(norm.get("dataset_id") or ""),
+                        data_repository=str(norm.get("data_repository") or ""),
+                        url=norm.get("url"),
+                        file=norm.get("file"),
+                        evidence_text=norm.get("evidence_text"),
                     )
+                )
 
     # Parse analysis methods
     if "analysis_methods" in data:
@@ -301,6 +449,41 @@ def parse_llm_response(response: str, model: str) -> ExtractedMetadata:
                             description=entry.get("description"),
                         )
                     )
+
+    # Parse measurement descriptor (single dict). Tolerate a list by taking the
+    # first dict element, and normalize each field to a stripped string or None.
+    if "measurement_descriptor" in data:
+        descriptor = data["measurement_descriptor"]
+        if isinstance(descriptor, list):
+            descriptor = next(
+                (d for d in descriptor if isinstance(d, dict)), None
+            )
+        if isinstance(descriptor, dict):
+            norm = _normalize_entry_keys(descriptor)
+
+            def _field(*names: str) -> str | None:
+                for name in names:
+                    value = norm.get(name)
+                    if value not in (None, ""):
+                        return str(value).strip()
+                return None
+
+            parsed_descriptor = MeasurementDescriptor(
+                biological_system=_field(
+                    "biological_system", "biological_system_cell_type", "cell_type"
+                ),
+                measured_compartment=_field(
+                    "measured_compartment", "compartment"
+                ),
+                species=_field("species"),
+                perturbations=_field(
+                    "perturbations", "perturbations_contrasts", "contrasts"
+                ),
+                omics_assay=_field("omics_assay", "omics", "assay"),
+                evidence_text=_field("evidence_text"),
+            )
+            if not parsed_descriptor.is_empty():
+                result.measurement_descriptor = parsed_descriptor
 
     return result
 
@@ -575,6 +758,42 @@ def store_extracted_code(
     return count
 
 
+def store_extracted_measurement_descriptor(
+    conn: sqlite3.Connection,
+    descriptor: MeasurementDescriptor,
+    model: str,
+    doi: str | None = None,
+    pmid: str | None = None,
+    pmcid: str | None = None,
+) -> int:
+    """Store an extracted measurement descriptor in the database.
+
+    Args:
+        conn: Database connection.
+        descriptor: The MeasurementDescriptor to store.
+        model: Name of the LLM model used for extraction.
+        doi: Article DOI.
+        pmid: Article PMID.
+        pmcid: Article PMCID.
+
+    Returns:
+        The id of the stored descriptor row.
+    """
+    return insert_measurement_descriptor(
+        conn,
+        model=model,
+        doi=doi,
+        pmid=pmid,
+        pmcid=pmcid,
+        biological_system=descriptor.biological_system,
+        measured_compartment=descriptor.measured_compartment,
+        species=descriptor.species,
+        perturbations=descriptor.perturbations,
+        omics_assay=descriptor.omics_assay,
+        evidence_text=descriptor.evidence_text,
+    )
+
+
 def store_llm_extraction_record(
     conn: sqlite3.Connection,
     prompt: str,
@@ -618,6 +837,7 @@ class ExtractionResult:
     processed_data_stored: int = 0
     analysis_methods_stored: int = 0
     code_stored: int = 0
+    measurement_descriptor_stored: bool = False
     extraction_id: int | None = None
     extracted_metadata: ExtractedMetadata | None = None
     error: str | None = None
@@ -779,6 +999,18 @@ def extract_and_store_metadata(
                 pmcid=article_pmcid,
             )
             logger.info("Stored %d code entries", result.code_stored)
+
+        if extracted.measurement_descriptor is not None:
+            store_extracted_measurement_descriptor(
+                conn,
+                extracted.measurement_descriptor,
+                model,
+                doi=article_doi,
+                pmid=article_pmid,
+                pmcid=article_pmcid,
+            )
+            result.measurement_descriptor_stored = True
+            logger.info("Stored measurement descriptor")
 
     finally:
         conn.close()

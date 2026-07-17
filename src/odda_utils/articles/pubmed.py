@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import requests
+
 from odda_utils.database import (
     init_db,
     insert_embedding,
@@ -26,7 +28,7 @@ from odda_utils.database import (
     link_article_mesh_qualifier,
 )
 from odda_utils.fetching import search_pubmed, fetch_article_metadata, download_pmc_article
-from odda_utils.fetching.pmc import DateType
+from odda_utils.fetching.pmc import DateType, SearchDb
 from odda_utils.metadata import FullArticleMetadata
 from odda_utils.metadata.llm_metadata import (
     build_extraction_prompt,
@@ -44,6 +46,7 @@ from odda_utils.utils import (
     AzureCredentialsError,
     check_existing_article,
     get_text_embedding,
+    NCBI_ID_CONVERTER_URL,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +66,52 @@ class SearchAndFetchResult:
     download_failed: int = 0
     llm_extracted: int = 0
     llm_extraction_failed: int = 0
+    unmapped_no_pmid: int = 0
+
+
+def _pmc_uids_to_pmids(pmc_uids: list[str]) -> dict[str, str | None]:
+    """Map PMC UIDs (from an esearch on ``db="pmc"``) to PMIDs.
+
+    An esearch against PubMed Central returns bare numeric PMC UIDs, while the
+    rest of the fetch pipeline is PMID-based. This uses the NCBI ID Converter
+    API (in batches) to resolve each PMC UID to its PMID, adding the ``PMC``
+    prefix the converter expects.
+
+    Parameters
+    ----------
+    pmc_uids : list of str
+        Numeric PMC UIDs without the ``PMC`` prefix.
+
+    Returns
+    -------
+    dict
+        Mapping of each input PMC UID to its PMID, or ``None`` when the record
+        has no associated PMID.
+    """
+    mapping: dict[str, str | None] = {}
+    batch_size = 200
+    for start in range(0, len(pmc_uids), batch_size):
+        batch = pmc_uids[start:start + batch_size]
+        params = {
+            "ids": ",".join(f"PMC{uid}" for uid in batch),
+            "idtype": "pmcid",
+            "format": "json",
+            "tool": "odda",
+            "email": "user@example.com",
+        }
+        response = requests.get(NCBI_ID_CONVERTER_URL, params=params, timeout=30)
+        response.raise_for_status()
+        for record in response.json().get("records", []):
+            pmcid = record.get("pmcid")
+            if not pmcid:
+                continue
+            uid = pmcid[3:] if pmcid.upper().startswith("PMC") else pmcid
+            mapping[uid] = record.get("pmid")
+
+    # Ensure every requested UID has an entry, even if the converter omitted it.
+    for uid in pmc_uids:
+        mapping.setdefault(uid, None)
+    return mapping
 
 
 def insert_article_metadata(
@@ -211,22 +260,24 @@ def search_and_fetch(
     download_dir: str | Path | None = None,
     extract_llm_metadata: bool = True,
     llm_model: str = "gpt-5",
+    db: SearchDb = "pubmed",
 ) -> SearchAndFetchResult:
-    """Search PubMed and fetch/process articles that haven't been processed yet.
+    """Search PubMed/PMC and fetch/process articles that haven't been processed yet.
 
     This function:
-    1. Searches PubMed for articles matching the query
-    2. For each article, checks if it's already in the database
-    3. If not (or if overwrite=True), fetches metadata and stores it
-    4. Extracts the abstract and generates a text embedding
-    5. Stores the embedding in the database
-    6. If download_dir is provided, downloads full text and supplementals from PMC
-    7. If extract_llm_metadata is True, extracts keywords, raw data, processed data,
+    1. Searches the chosen Entrez database (``db``) for articles matching the query
+    2. When searching PMC, resolves the returned PMC UIDs to PMIDs
+    3. For each article, checks if it's already in the database
+    4. If not (or if overwrite=True), fetches metadata and stores it
+    5. Extracts the abstract and generates a text embedding
+    6. Stores the embedding in the database
+    7. If download_dir is provided, downloads full text and supplementals from PMC
+    8. If extract_llm_metadata is True, extracts keywords, raw data, processed data,
        and analysis methods from the downloaded full text using an LLM
 
     Args:
         db_path: Path to the SQLite database file.
-        query: PubMed articles query string.
+        query: Entrez query string.
         start_date: Start date for filtering (inclusive).
         end_date: End date for filtering (inclusive).
         date_type: Type of date to filter on ("edat", "pdat", "mdat").
@@ -240,6 +291,10 @@ def search_and_fetch(
         extract_llm_metadata: If True, use LLM to extract metadata from downloaded
             full text. Requires download_dir to be set.
         llm_model: Name of the Azure OpenAI chat model deployment for LLM extraction.
+        db: Entrez database to search, ``"pubmed"`` (default) or ``"pmc"``
+            (PubMed Central). Use ``"pmc"`` for full-text queries (e.g. those
+            using ``[body]``); ``"pubmed"`` silently ignores PMC-only field
+            tags and would search a different corpus.
 
     Returns:
         SearchAndFetchResult with statistics about the operation.
@@ -261,6 +316,7 @@ def search_and_fetch(
             download_dir=download_dir,
             extract_llm_metadata=extract_llm_metadata,
             llm_model=llm_model,
+            db=db,
         )
     finally:
         conn.close()
@@ -280,6 +336,7 @@ def _search_and_fetch_impl(
     download_dir: str | Path | None,
     extract_llm_metadata: bool,
     llm_model: str,
+    db: SearchDb,
 ) -> SearchAndFetchResult:
     """Implementation of search_and_fetch with an existing connection."""
     # Validate Azure credentials before starting the pipeline
@@ -291,18 +348,19 @@ def _search_and_fetch_impl(
             f"Azure OpenAI credentials required for embedding generation. {e}"
         ) from e
 
-    # Search PubMed
-    logger.info("Searching PubMed for: %s", query)
-    pmids = search_pubmed(
+    # Search the chosen Entrez database
+    logger.info("Searching %s for: %s", db, query)
+    found_ids = search_pubmed(
         query=query,
         start_date=start_date,
         end_date=end_date,
         date_type=date_type,
         max_results=max_results,
+        db=db,
     )
 
     result = SearchAndFetchResult(
-        total_found=len(pmids),
+        total_found=len(found_ids),
         already_processed=0,
         newly_processed=0,
         overwritten=0,
@@ -310,7 +368,23 @@ def _search_and_fetch_impl(
         skipped_no_abstract=0,
     )
 
-    logger.info("Found %d articles", len(pmids))
+    logger.info("Found %d records in %s", len(found_ids), db)
+
+    # A PMC search returns PMC UIDs; the rest of the pipeline is PMID-based, so
+    # resolve them to PMIDs. Records with no associated PMID cannot be processed
+    # through the PubMed metadata path and are reported via unmapped_no_pmid.
+    if db == "pmc":
+        uid_to_pmid = _pmc_uids_to_pmids(found_ids)
+        pmids = []
+        for uid in found_ids:
+            pmid = uid_to_pmid.get(uid)
+            if pmid:
+                pmids.append(pmid)
+            else:
+                logger.warning("PMC UID %s has no associated PMID; skipping", uid)
+                result.unmapped_no_pmid += 1
+    else:
+        pmids = found_ids
 
     for pmid in pmids:
         # Fetch metadata first to get all identifiers
