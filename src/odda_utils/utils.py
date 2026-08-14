@@ -26,7 +26,13 @@ from odda_utils.database import (
 )
 from odda_utils.metadata import logger
 
-NCBI_ID_CONVERTER_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+# NCBI retired the legacy ID converter at
+# https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/, which now answers with an
+# HTTP 301 to the address below. ``requests`` follows redirects by default so the
+# old constant still worked here, but clients that do not (e.g. httpx) failed
+# outright; point at the current endpoint directly so behaviour does not depend
+# on redirect handling.
+NCBI_ID_CONVERTER_URL = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
 
 _search_logger = logging.getLogger(__name__)
 
@@ -115,11 +121,33 @@ def _convert_id(
     if "errmsg" in record:
         return ArticleIds(**{id_type: id_value})
 
+    # The current converter returns pmid as a JSON number while the legacy
+    # endpoint returned a string; normalise so downstream string comparisons
+    # and database lookups keep working.
     return ArticleIds(
-        doi=record.get("doi"),
-        pmid=record.get("pmid"),
-        pmcid=record.get("pmcid"),
+        doi=_as_str(record.get("doi")),
+        pmid=_as_str(record.get("pmid")),
+        pmcid=_as_str(record.get("pmcid")),
     )
+
+
+def _as_str(value: object | None) -> str | None:
+    """Coerce an identifier returned by NCBI to a string.
+
+    Parameters
+    ----------
+    value : object or None
+        Raw identifier value taken from the converter response. May be a
+        string, an integer (PMIDs are returned as JSON numbers), or None.
+
+    Returns
+    -------
+    str or None
+        The identifier as a string, or None if no value was present.
+    """
+    if value is None:
+        return None
+    return str(value)
 
 
 def convert_ids(

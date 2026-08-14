@@ -24,7 +24,11 @@ import xml.etree.ElementTree as ET
 
 # NCBI E-utilities endpoints.
 NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-NCBI_ID_CONVERTER_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+# NCBI retired the legacy converter at /pmc/utils/idconv/v1.0/, which now
+# answers with an HTTP 301. httpx does not follow redirects by default, so the
+# old address surfaced as "PMCID conversion failed: Redirect response '301 Moved
+# Permanently'" for every PMCID-only lookup.
+NCBI_ID_CONVERTER_URL = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
 
 # Identify this client to NCBI per their usage guidelines.
 NCBI_TOOL_NAME = "odda-article-validator"
@@ -481,7 +485,9 @@ async def fetch_pubmed_metadata(
             await rate_limiter.acquire()
         converter_params = {"ids": pmcid, "format": "json"}
         converter_params.update(_ncbi_common_params(resolved_api_key))
-        async with httpx.AsyncClient() as client:
+        # follow_redirects keeps conversion working if NCBI relocates the
+        # endpoint again rather than failing on the 3xx itself.
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             try:
                 resp = await _get_with_backoff(
                     client, NCBI_ID_CONVERTER_URL, params=converter_params, timeout=timeout
@@ -489,7 +495,8 @@ async def fetch_pubmed_metadata(
                 conv_data = resp.json()
                 records = conv_data.get("records", [])
                 if records and "pmid" in records[0]:
-                    params["id"] = records[0]["pmid"]
+                    # PMIDs come back as JSON numbers; efetch needs a string.
+                    params["id"] = str(records[0]["pmid"])
                 else:
                     return ArticleMetadata(source="pubmed", error=f"Could not convert {pmcid} to PMID")
             except Exception as e:
