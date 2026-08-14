@@ -816,15 +816,94 @@ def _extract_text_from_nxml(nxml_content: bytes) -> str:
                 sections.append(_get_text(p))
                 sections.append("")
 
-    # Extract back matter (references summary)
+    # Extract back matter. Statement blocks here (data availability, code
+    # availability, funding, ethics) must be kept: publishers disagree about
+    # where the data availability statement lives, and for those that put it in
+    # <back> it is the only place a dataset accession may appear.
     back = root.find(".//back")
     if back is not None:
+        sections.extend(_extract_statement_blocks(back))
+
         ref_list = back.find(".//ref-list")
         if ref_list is not None:
             ref_count = len(ref_list.findall("ref"))
             sections.append(f"\nREFERENCES: {ref_count} references\n")
 
     return "\n".join(sections).strip()
+
+
+def _extract_statement_blocks(parent: ET.Element) -> list[str]:
+    """Extract titled statement blocks from an article's back matter.
+
+    Walks every ``<sec>`` and ``<notes>`` descendant of ``parent`` and emits a
+    heading followed by that element's own paragraphs. Only direct ``<p>``
+    children are taken from each element so that nested blocks (for example the
+    ethics and consent notes that Springer nests inside a "Declarations" note)
+    are emitted once under their own heading rather than duplicated into their
+    parent.
+
+    This exists because data availability statements are not stored uniformly
+    across publishers. Springer, Nature and BMC articles use
+    ``<back><notes notes-type="data-availability">``, ASM uses
+    ``<back><sec sec-type="data-availability">``, while ACS, Elsevier and Oxford
+    place the same statement in ``<body>``. Extracting ``<body>`` alone silently
+    drops the statement, and with it every accession mentioned only there.
+
+    Parameters
+    ----------
+    parent : xml.etree.ElementTree.Element
+        The ``<back>`` element of a JATS/NXML article.
+
+    Returns
+    -------
+    list of str
+        Formatted text blocks, each a heading line followed by its paragraphs.
+        Elements carrying no direct paragraph text are skipped.
+    """
+    blocks: list[str] = []
+
+    for node in parent.iter():
+        if node.tag not in ("sec", "notes"):
+            continue
+
+        paragraphs = [text for p in node.findall("p") if (text := _get_text(p))]
+        if not paragraphs:
+            continue
+
+        blocks.append(f"\n{_statement_heading(node)}\n")
+        blocks.extend(paragraphs)
+        blocks.append("")
+
+    return blocks
+
+
+def _statement_heading(node: ET.Element) -> str:
+    """Derive an upper-case heading for a back-matter statement block.
+
+    Prefers the element's ``<title>``. Some publishers omit the title and carry
+    the meaning only in the ``notes-type``/``sec-type`` attribute (for example
+    ``notes-type="funding-statement"``), so those attributes are used as a
+    fallback before giving up on a generic label.
+
+    Parameters
+    ----------
+    node : xml.etree.ElementTree.Element
+        A ``<sec>`` or ``<notes>`` element.
+
+    Returns
+    -------
+    str
+        An upper-case heading such as ``DATA AVAILABILITY``.
+    """
+    title = node.find("title")
+    if title is not None and (title_text := _get_text(title)):
+        return title_text.upper()
+
+    node_type = node.get("notes-type") or node.get("sec-type")
+    if node_type:
+        return node_type.replace("-", " ").replace("_", " ").upper()
+
+    return "NOTES"
 
 
 def _get_text(element: ET.Element) -> str:
